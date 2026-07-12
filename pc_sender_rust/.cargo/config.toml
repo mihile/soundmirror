@@ -1,0 +1,4 @@
+# The bundled libopus (audiopus_sys) ships an old CMakeLists that CMake 4.x
+# rejects. This env var lets modern CMake configure it anyway.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

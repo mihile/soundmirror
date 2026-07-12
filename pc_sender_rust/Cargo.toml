@@ -1,0 +1,41 @@
+[package]
+name = "soundmirror_sender_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Security",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# GUI & Tray & Autostart dependencies
+eframe = "0.26"
+tray-icon = "0.14"
+winreg = "0.52"
+image = { version = "0.24", default-features = false, features = ["png"] }
+audiopus = "0.3.0-rc.0"
+# Pure-Rust FLAC encoder for the lossless wire codec (no C deps).
+flacenc = "0.4"
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+# Drop debug symbols from the shipped .exe (smaller binary; opt-level stays at 3
+# since this is a real-time audio path where we want speed, not size, in codegen).
+strip = true
+
+[build-dependencies]
+winres = "0.1"
