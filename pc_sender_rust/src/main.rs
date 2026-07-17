@@ -98,6 +98,9 @@ static GUI_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 // RMS is display-only work. The capture thread skips it completely while the GUI is
 // in the tray and limits it to the visualizer's useful cadence while it is visible.
 static GUI_VISIBLE: AtomicBool = AtomicBool::new(false);
+// Serialize native hide/show transitions. The minimize watcher and tray handlers run
+// on different threads and must not restore and re-hide the same HWND out of order.
+static WINDOW_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // Shareable real-time audio statistics for GUI
 static CURRENT_AMPLITUDE: AtomicU32 = AtomicU32::new(0);
@@ -1251,6 +1254,7 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
 
 // Native Win32 window management for reliable tray hide/show
 fn native_minimize_to_tray() {
+    let _window_state_guard = WINDOW_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let title: Vec<u16> = "SoundMirror PC Sender\0".encode_utf16().collect();
     unsafe {
         let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
@@ -1261,16 +1265,35 @@ fn native_minimize_to_tray() {
             style |= WS_EX_TOOLWINDOW.0 as i32;
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style);
 
-            // Keep the native window minimized instead of Visible(false). eframe 0.26
-            // excludes minimized windows from redraw scheduling, while an invisible
-            // window with an expired repaint deadline busy-spins RedrawWindow. The
-            // TOOLWINDOW style above keeps this minimized window off the taskbar/Alt-Tab.
+            // First minimize so eframe 0.26 excludes this viewport from redraw
+            // scheduling, then hide the still-iconic native window. A minimized
+            // TOOLWINDOW without a taskbar button otherwise appears as a tiny title bar
+            // at the bottom-left of the desktop. Keeping it iconic while hidden avoids
+            // both that artifact and the invisible-window RedrawWindow busy loop.
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+fn native_hide_if_minimized() {
+    let _window_state_guard = WINDOW_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let title: Vec<u16> = "SoundMirror PC Sender\0".encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
+        if hwnd.0 != 0 && IsIconic(hwnd).as_bool() {
+            let mut style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            style &= !(WS_EX_APPWINDOW.0 as i32);
+            style |= WS_EX_TOOLWINDOW.0 as i32;
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style);
+            GUI_VISIBLE.store(false, Ordering::Release);
+            let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
 }
 
 fn native_show_window() {
+    let _window_state_guard = WINDOW_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let title: Vec<u16> = "SoundMirror PC Sender\0".encode_utf16().collect();
     unsafe {
         let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
@@ -1293,8 +1316,8 @@ fn request_gui_show() {
     // The native window must be visible before request_repaint(): eframe 0.26's
     // Windows runner otherwise turns an expired invisible-window deadline into a
     // RedrawWindow busy-loop.
-    GUI_VISIBLE.store(true, Ordering::Release);
     native_show_window();
+    GUI_VISIBLE.store(true, Ordering::Release);
     if let Some(ctx) = GUI_CONTEXT.get() {
         ctx.request_repaint();
     }
@@ -1687,6 +1710,21 @@ fn main() {
             } else if event.id == "exit" {
                 RUNNING.store(false, Ordering::Relaxed);
                 std::process::exit(0);
+            }
+        }
+    });
+
+    // eframe stops repainting as soon as Windows marks the viewport minimized, so its
+    // next update is not guaranteed to run the minimize-to-tray branch above. Watch
+    // only while the GUI is visible and hide the iconic native window promptly. In
+    // tray mode this backs off to four cheap atomic checks per second.
+    thread::spawn(|| {
+        while RUNNING.load(Ordering::Relaxed) {
+            if GUI_VISIBLE.load(Ordering::Acquire) {
+                native_hide_if_minimized();
+                thread::sleep(Duration::from_millis(25));
+            } else {
+                thread::sleep(Duration::from_millis(250));
             }
         }
     });
