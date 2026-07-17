@@ -21,7 +21,6 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -84,6 +83,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -103,8 +103,6 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.PriorityQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
@@ -127,6 +125,11 @@ private const val CHANNELS = 2
 // before giving up — keeps auto-reconnecting through brief Wi-Fi blips (~30s).
 private const val AUDIO_SOCKET_TIMEOUT_MS = 2000
 private const val MAX_RECONNECT_TIMEOUTS = 15
+// Audio-reactive visuals are independent from the numeric stats sampling setting.
+// 20 Hz is smooth enough for the meter while avoiding a recomposition per packet.
+private const val AUDIO_LEVEL_UPDATE_INTERVAL_MS = 50L
+// Playback-health checks must never be disabled by the UI stats setting.
+private const val PLAYBACK_MAINTENANCE_INTERVAL_MS = 250L
 // Jitter-buffer depth (ms) when the "deep buffer" feature is on. Deep on purpose: it
 // rides straight through Android's periodic background Wi-Fi scans (radio leaves the
 // channel ~1-3s every few minutes) and power-save bursts. The cost is that playout
@@ -204,7 +207,6 @@ data class StreamStats(
     val connected: Boolean = false,
     val deviceName: String = "",
     val deviceIp: String = "",
-    val amplitude: Float = 0f,
     val packetLoss: Float = 0f,
     val jitterBuffer: Int = 0,
     val jitterMs: Int = 0,
@@ -231,7 +233,8 @@ data class StreamSettings(
     val codec: AudioCodec = AudioCodec.Opus,
     val volume: Float = 1f,
     val requestLowLatency: Boolean = true,
-    // Zero freezes live metrics; connection lifecycle remains active.
+    // Sampling interval for numeric metrics only. Zero freezes those metrics;
+    // connection lifecycle, audio visuals, and playback maintenance stay active.
     val statsRefreshMs: Long = 250L,
     // Sub-features (each applied immediately when on):
     //  deepBuffer — large jitter buffer that rides through Wi-Fi scans/bursts; adds
@@ -349,10 +352,20 @@ class DiscoveryManager(context: Context, private val scope: CoroutineScope) {
 
 class AudioStreamClient(private val context: Context, private val scope: CoroutineScope) {
     private var job: Job? = null
+    // Every connect/disconnect invalidates older session finalizers. Without this,
+    // a quick double tap can let the cancelled session publish disconnected after
+    // the replacement session is already running, which also drops our service locks.
+    private val sessionGeneration = AtomicLong(0L)
     @Volatile private var settings = StreamSettings()
     private val _stats = MutableStateFlow(StreamStats())
     val stats: StateFlow<StreamStats> = _stats.asStateFlow()
+    private val _audioLevel = MutableStateFlow(0f)
+    val audioLevel: StateFlow<Float> = _audioLevel.asStateFlow()
     private var reusableShorts = ShortArray(65535)
+    private var upsampleShorts = ShortArray(0)
+    private var decodedSampleCount = 0
+    private var lowLatencyBufferCeilingFrames = 0
+    private var lastPartialWriteLogMs = 0L
     @Volatile private var rttMs = 0L
     // Last time the control channel (SM_PING/PONG) confirmed the PC is reachable.
     // Lets us tell "PC is silent" apart from "connection lost".
@@ -380,18 +393,6 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             r.run()
         }, "sm-playout")
     }.asCoroutineDispatcher()
-
-    // Reusable decode output buffers. Packet sizes are constant within a stream, so
-    // these hit steady-state reuse and remove ~0.5-1 MB/s of per-packet ByteArray
-    // garbage — fewer GC pauses (micro-stutters) and less battery.
-    private var adpcmBytes = ByteArray(0)
-    private var mulawBytes = ByteArray(0)
-    private var opusBytes = ByteArray(0)
-    private var flacBytes = ByteArray(0)
-    private var upsampleBytes = ByteArray(0)
-
-    private fun reusableBytes(current: ByteArray, needed: Int): ByteArray =
-        if (current.size == needed) current else ByteArray(needed)
 
     private fun releaseFlac() {
         if (flacHandle != 0L) {
@@ -430,6 +431,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
     fun connect(device: DiscoveredDevice, initialSettings: StreamSettings) {
         settings = initialSettings
         val previous = job
+        val session = sessionGeneration.incrementAndGet()
         _stats.value = StreamStats(
             connected = true,
             deviceName = device.name,
@@ -439,9 +441,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             latencyMs = settings.codec.estimatedBufferMs(settings.prebufferPackets),
             latencyLabel = "${settings.codec.estimatedBufferMs(settings.prebufferPackets)}ms",
         )
-        opusDecoder?.close()
-        opusDecoder = null
-        releaseFlac()
+        _audioLevel.value = 0f
         // Cancel the previous session BEFORE scheduling the new one: both sessions run
         // on the single playout thread, so if the new body were the one to deliver the
         // cancel, the old loop would never yield the thread and we'd deadlock.
@@ -450,6 +450,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             // Make sure any previous session has fully released the audio socket
             // before we rebind it — otherwise a quick reconnect hits EADDRINUSE.
             try { previous?.join() } catch (_: Exception) {}
+            if (sessionGeneration.get() != session) return@launch
             var socket: DatagramSocket? = null
             var track: AudioTrack? = null
             try {
@@ -462,9 +463,10 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 announceConnect(device)
                 track = createAudioTrack(device.sampleRate, device.channels, settings).apply {
                     setVolume(settings.volume)
-                    play()
                 }
                 receiveAudio(socket, track, device)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 // Never crash the app on a connect/bind failure — just reset state.
                 Log.w("SoundMirror", "connect failed", e)
@@ -475,19 +477,32 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 opusDecoder?.close()
                 opusDecoder = null
                 releaseFlac()
-                _stats.value = StreamStats()
+                if (sessionGeneration.get() == session) {
+                    _audioLevel.value = 0f
+                    _stats.value = StreamStats()
+                }
             }
         }
     }
 
     fun disconnect() {
+        sessionGeneration.incrementAndGet()
         job?.cancel()
         job = null
+        _audioLevel.value = 0f
+        _stats.value = StreamStats()
     }
 
     private fun createAudioTrack(sampleRate: Int, channels: Int, streamSettings: StreamSettings): AudioTrack {
         val mask = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
-        val minBuffer = AudioTrack.getMinBufferSize(sampleRate, mask, AudioFormat.ENCODING_PCM_16BIT)
+        val bytesPerFrame = channels.coerceAtLeast(1) * 2
+        val minBufferResult = AudioTrack.getMinBufferSize(
+            sampleRate,
+            mask,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        require(minBufferResult > 0) { "AudioTrack rejected $sampleRate Hz / $channels ch" }
+        val minBuffer = minBufferResult.coerceAtLeast(bytesPerFrame)
         // Keep the AudioTrack buffer SMALL. The jitter buffer lives in our own queue
         // (clock-driven playout drains it), so WRITE_BLOCKING must pace us tightly to
         // real time — a large track buffer would let us drain the queue faster than
@@ -495,7 +510,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         // chop). A couple of minBuffers is just enough to ride thread-scheduling jitter.
         val multiplier = if (streamSettings.requestLowLatency) 2 else 3
         val bufferBytes = (minBuffer * multiplier).coerceAtLeast(minBuffer)
-        return AudioTrack.Builder()
+        val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -519,6 +534,29 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             )
             .setBufferSizeInBytes(bufferBytes)
             .build()
+        if (streamSettings.requestLowLatency) {
+            // Reserve the old 2x capacity as a safety ceiling, but expose only one
+            // minBuffer to AudioFlinger initially. receiveAudio() grows this active
+            // size if the device reports a real underrun.
+            val requestedCapacityFrames = (bufferBytes / bytesPerFrame).coerceAtLeast(1)
+            lowLatencyBufferCeilingFrames = minOf(
+                requestedCapacityFrames,
+                track.bufferCapacityInFrames.coerceAtLeast(1),
+            )
+            val initialFrames = (minBuffer / bytesPerFrame)
+                .coerceIn(1, lowLatencyBufferCeilingFrames)
+            val appliedFrames = runCatching { track.setBufferSizeInFrames(initialFrames) }
+                .getOrNull()
+                ?.takeIf { it > 0 }
+                ?: track.bufferSizeInFrames
+            Log.d(
+                "SoundMirrorPerf",
+                "AudioTrack low-latency buffer=$appliedFrames/$lowLatencyBufferCeilingFrames frames",
+            )
+        } else {
+            lowLatencyBufferCeilingFrames = 0
+        }
+        return track
     }
 
     private fun announceConnect(device: DiscoveredDevice, repeatCount: Int = 3) {
@@ -555,8 +593,18 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         var totalFramesWritten = 0L
         var isBuffering = true
         var smoothedLatencyMs = 0.0
-        var lastUiUpdateMs = 0L
+        var lastStatsSampleMs = 0L
+        var lastAudioLevelUpdateMs = 0L
+        var lastMaintenanceMs = 0L
         var lastTrimMs = 0L
+        // Set after the initial jitter prebuffer is ready. AudioTrack can report a
+        // startup underrun before the first write; that is not evidence to grow.
+        var lastUnderrunCount = -1
+        // Prime one decoded packet into AudioTrack before play/resume. Starting an
+        // empty track creates an artificial underrun that would make the adaptive
+        // low-latency buffer grow even on an otherwise healthy connection.
+        var resumeTrackAfterWrite = false
+        var activeTrackBufferFrames = runCatching { track.bufferSizeInFrames }.getOrDefault(0)
         // AudioTrack is created already at settings.volume; only re-apply when the
         // user actually changes the volume, instead of on every played packet.
         var lastVolume = settings.volume
@@ -679,8 +727,9 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         // network stalls (e.g. a periodic Wi-Fi background scan leaves the channel for
         // 1-3s every few minutes) we keep playing buffered audio instead of underrunning.
         var prevDeepMode = deepBufferMode()
-        // For non-Opus loss concealment: number of shorts in the last packet written
-        // (still sitting in reusableShorts) and whether to fade the next packet in.
+        // For non-Opus loss concealment: retain the last decoded buffer until the next
+        // packet is decoded, so a missing packet can fade it out without a copy.
+        var prevBuffer: ShortArray? = null
         var prevSamples = 0
         var fadeInNext = false
         try {
@@ -729,6 +778,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     smoothedLatencyMs = 0.0
                     if (deepMode) {
                         isBuffering = true
+                        resumeTrackAfterWrite = false
                         try { track.pause() } catch (_: Exception) {}
                     }
                 }
@@ -751,7 +801,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 if (isBuffering) {
                     if (queue.size >= prebufferTarget) {
                         isBuffering = false
-                        try { track.play() } catch (_: Exception) {}
+                        resumeTrackAfterWrite = true
                     } else {
                         val p = packetChannel.receiveCatching().getOrNull() ?: break
                         queue.add(p)
@@ -771,6 +821,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         queue.add(p)
                     } else if (currentCoroutineContext().isActive) {
                         isBuffering = true
+                        resumeTrackAfterWrite = false
                         try { track.pause() } catch (_: Exception) {}
                     } else {
                         break
@@ -785,26 +836,23 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     if (playPacket.codec == WireCodec.Opus) {
                         // Opus has real packet-loss concealment — let it synthesise the gap.
                         val missing = (playPacket.seq - expected).coerceAtMost(5).toInt()
-                        val plc = concealOpus(playPacket.frames, missing)
-                        if (plc.isNotEmpty()) {
-                            val plcSamples = fillReusableShorts(plc)
-                            track.write(reusableShorts, 0, plcSamples, AudioTrack.WRITE_BLOCKING)
-                            totalFramesWritten += plcSamples / 2
-                        }
-                    } else if (prevSamples > 0) {
-                        // PCM/ADPCM/MULAW have no PLC. Fade the previous frame (still in
-                        // reusableShorts) out to zero so a lost packet decays smoothly
+                        val plcSamples = concealOpus(playPacket.frames, missing, track)
+                        totalFramesWritten += plcSamples / 2
+                    } else if (prevSamples > 0 && prevBuffer != null) {
+                        // PCM/ADPCM/MULAW have no PLC. Fade the retained previous frame
+                        // out to zero so a lost packet decays smoothly
                         // instead of a hard click, and flag the next frame to fade back in.
                         val frames = (prevSamples / 2).coerceAtLeast(1)
+                        val previous = prevBuffer
                         var i = 0
                         while (i < prevSamples) {
                             val g = 1f - (i / 2) / frames.toFloat()
-                            reusableShorts[i] = (reusableShorts[i] * g).toInt().toShort()
-                            reusableShorts[i + 1] = (reusableShorts[i + 1] * g).toInt().toShort()
+                            previous[i] = (previous[i] * g).toInt().toShort()
+                            previous[i + 1] = (previous[i + 1] * g).toInt().toShort()
                             i += 2
                         }
-                        track.write(reusableShorts, 0, prevSamples, AudioTrack.WRITE_BLOCKING)
-                        totalFramesWritten += prevSamples / 2
+                        val written = writeFully(track, previous, prevSamples)
+                        totalFramesWritten += written / 2
                         fadeInNext = true
                     }
                 }
@@ -816,7 +864,9 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     lastVolume = vol
                 }
                 val decoded = decodePacket(playPacket, device.sampleRate)
+                val samples = decodedSampleCount
                 var decodedRms = -1f
+                val packetTimeMs = System.currentTimeMillis()
 
                 // Silence-aware latency shedding: when we're holding more than the target
                 // (queue backlog after a Wi-Fi burst, or a ballooned AudioTrack buffer),
@@ -829,11 +879,30 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         1000.0 / device.sampleRate.coerceAtLeast(1)
                 } catch (_: Exception) { 0.0 }
                 if (queue.size > prebufferTarget || aheadMs > 90.0) {
-                    decodedRms = pcmAmplitude(decoded)
-                    if (decodedRms < SILENCE_SHED_RMS) continue
+                    // This RMS is operational: it must run even with no UI subscriber
+                    // because it lets us shed accumulated latency during silence.
+                    decodedRms = pcmAmplitude(decoded, samples)
+                    if (decodedRms < SILENCE_SHED_RMS) {
+                        if (_audioLevel.subscriptionCount.value > 0 &&
+                            packetTimeMs - lastAudioLevelUpdateMs >= AUDIO_LEVEL_UPDATE_INTERVAL_MS
+                        ) {
+                            lastAudioLevelUpdateMs = packetTimeMs
+                            _audioLevel.value = decodedRms
+                        }
+                        // A deliberately discarded silent packet must not become the
+                        // source for later non-Opus loss concealment. In particular,
+                        // codec/frame-size changes could otherwise expose stale tail data.
+                        prevBuffer = null
+                        prevSamples = 0
+                        // Silence shedding intentionally lets the hardware queue drain.
+                        // Do not interpret that planned underrun as evidence that the
+                        // 1x low-latency AudioTrack buffer is too small.
+                        lastUnderrunCount = runCatching { track.underrunCount }
+                            .getOrDefault(lastUnderrunCount.coerceAtLeast(0))
+                        continue
+                    }
                 }
 
-                val samples = fillReusableShorts(decoded)
                 if (fadeInNext && samples > 0) {
                     // Ramp the first packet after a concealed gap up from zero so the
                     // resume is click-free too.
@@ -841,21 +910,103 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     var i = 0
                     while (i < samples) {
                         val g = (i / 2) / frames.toFloat()
-                        reusableShorts[i] = (reusableShorts[i] * g).toInt().toShort()
-                        reusableShorts[i + 1] = (reusableShorts[i + 1] * g).toInt().toShort()
+                        decoded[i] = (decoded[i] * g).toInt().toShort()
+                        decoded[i + 1] = (decoded[i + 1] * g).toInt().toShort()
                         i += 2
                     }
                     fadeInNext = false
                 }
-                track.write(reusableShorts, 0, samples, AudioTrack.WRITE_BLOCKING)
-                totalFramesWritten += samples / 2
+                val written = writeFully(track, decoded, samples)
+                if (resumeTrackAfterWrite && written > 0) {
+                    try { track.play() } catch (_: Exception) {}
+                    resumeTrackAfterWrite = false
+                    lastUnderrunCount = runCatching { track.underrunCount }.getOrDefault(0)
+                }
+                totalFramesWritten += written / 2
+                prevBuffer = decoded
                 prevSamples = samples
 
-                // 5) Throttled stats + latency trim.
+                // 5) Publish the audio-reactive level on its own fixed cadence. This
+                // remains smooth even when numeric metrics are slow or frozen.
                 val now = System.currentTimeMillis()
-                val uiUpdateIntervalMs = settings.statsRefreshMs
-                if (uiUpdateIntervalMs > 0L && now - lastUiUpdateMs >= uiUpdateIntervalMs) {
-                    lastUiUpdateMs = now
+                if (_audioLevel.subscriptionCount.value > 0 &&
+                    now - lastAudioLevelUpdateMs >= AUDIO_LEVEL_UPDATE_INTERVAL_MS
+                ) {
+                    lastAudioLevelUpdateMs = now
+                    if (decodedRms < 0f) decodedRms = pcmAmplitude(decoded, samples)
+                    _audioLevel.value = decodedRms
+                }
+
+                // Playback maintenance is operational audio logic, not UI state. Keep
+                // checking it even when the user freezes numeric metric sampling.
+                if (now - lastMaintenanceMs >= PLAYBACK_MAINTENANCE_INTERVAL_MS) {
+                    lastMaintenanceMs = now
+                    val underrunCount = runCatching { track.underrunCount }
+                        .getOrDefault(lastUnderrunCount.coerceAtLeast(0))
+                    val underrunAdvanced = lastUnderrunCount >= 0 &&
+                        underrunCount > lastUnderrunCount
+                    // Silence can intentionally drain the track while we shed latency.
+                    // Grow the hardware buffer only when an underrun coincides with
+                    // audible PCM; otherwise a quiet PC would permanently forfeit the
+                    // 1x low-latency setting before the next sound starts.
+                    val audibleUnderrun = underrunAdvanced &&
+                        (if (decodedRms >= 0f) decodedRms else pcmAmplitude(decoded, samples)) >=
+                            SILENCE_SHED_RMS
+                    if (audibleUnderrun &&
+                        lowLatencyBufferCeilingFrames > 0 &&
+                        activeTrackBufferFrames < lowLatencyBufferCeilingFrames
+                    ) {
+                        // Increase in small steps only after evidence that 1x minBuffer
+                        // was insufficient. This keeps the common path low latency while
+                        // adapting automatically on devices with tighter scheduling.
+                        // Grow by one wire packet (normally 10 ms), not a quarter of
+                        // AudioTrack capacity. Bluetooth devices report a very large
+                        // minBuffer, where a 1/4 step can add ~90 ms from one underrun.
+                        val stepFrames = playPacket.frames.coerceAtLeast(1)
+                        val requestedFrames = (activeTrackBufferFrames + stepFrames)
+                            .coerceAtMost(lowLatencyBufferCeilingFrames)
+                        val appliedFrames = runCatching {
+                            track.setBufferSizeInFrames(requestedFrames)
+                        }.getOrDefault(activeTrackBufferFrames)
+                        if (appliedFrames > 0) {
+                            activeTrackBufferFrames = appliedFrames
+                            Log.d(
+                                "SoundMirrorPerf",
+                                "underrun: buffer -> $activeTrackBufferFrames/$lowLatencyBufferCeilingFrames frames",
+                            )
+                        }
+                    }
+                    lastUnderrunCount = underrunCount
+                    val maintenanceTrackDelayMs = try {
+                        val head = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
+                        val written = totalFramesWritten - head
+                        if (written > 0) (written * 1000.0 / device.sampleRate.coerceAtLeast(1)) else 0.0
+                    } catch (_: Exception) {
+                        0.0
+                    }
+                    if (!deepMode && maintenanceTrackDelayMs > 100.0 && now - lastTrimMs > 2500) {
+                        Log.d("SoundMirrorLat", "trim: track=${maintenanceTrackDelayMs.toInt()}ms -> reset")
+                        lastTrimMs = now
+                        lost += queue.size.toLong()
+                        queue.clear()
+                        expectedSeq = null
+                        try {
+                            track.pause()
+                            track.flush()
+                            totalFramesWritten = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
+                        } catch (_: Exception) {}
+                        prevSamples = 0
+                        prevBuffer = null
+                        fadeInNext = false
+                        smoothedLatencyMs = 0.0
+                        isBuffering = true
+                    }
+                }
+
+                // 6) Sample and publish numeric metrics only at the selected cadence.
+                val statsSampleIntervalMs = settings.statsRefreshMs
+                if (statsSampleIntervalMs > 0L && now - lastStatsSampleMs >= statsSampleIntervalMs) {
+                    lastStatsSampleMs = now
                     if (now - lastBitrateUpdateMs >= 1000) {
                         lastBitrateUpdateMs = now
                         bitrateSamples.addLast(now to receivedPayloadBytes.get())
@@ -887,33 +1038,6 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         0.0
                     }
 
-                    // Trim a ballooned playout buffer. This only fires when the AudioTrack
-                    // buffer has grown large — which happens on Bluetooth (the OS allocates
-                    // a big A2DP buffer and WRITE_BLOCKING fills it, pinning latency at
-                    // ~300ms). On a small wired/speaker buffer trackDelay never reaches the
-                    // threshold, so this never fires there (no glitch on wired). We let the
-                    // buffer fill (so BT keeps streaming), then flush the excess back down —
-                    // each trim costs one brief rebuffer "tick" but keeps BT latency low.
-                    // Deep-buffer mode deliberately accepts latency for continuity.
-                    // Flushing AudioTrack here fought that policy and caused a periodic
-                    // audible tick followed by another full rebuffer.
-                    if (!deepMode && trackDelayMs > 100.0 && now - lastTrimMs > 2500) {
-                        Log.d("SoundMirrorLat", "trim: track=${trackDelayMs.toInt()}ms -> reset")
-                        lastTrimMs = now
-                        lost += queue.size.toLong()
-                        queue.clear()
-                        expectedSeq = null
-                        try {
-                            track.pause()
-                            track.flush()
-                            totalFramesWritten = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
-                        } catch (_: Exception) {}
-                        prevSamples = 0
-                        fadeInNext = false
-                        smoothedLatencyMs = 0.0
-                        isBuffering = true
-                    }
-
                     val totalLatencyMs = networkDelayMs + queueDelayMs + trackDelayMs
                     if (smoothedLatencyMs == 0.0) {
                         smoothedLatencyMs = totalLatencyMs
@@ -926,7 +1050,6 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         connected = true,
                         deviceName = device.name,
                         deviceIp = device.ip,
-                        amplitude = if (decodedRms >= 0f) decodedRms else pcmAmplitude(decoded),
                         packetLoss = lossRate,
                         jitterBuffer = queue.size,
                         jitterMs = jitterEstimateMs.roundToInt(),
@@ -955,23 +1078,47 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         if (!isV2 && data[3].toInt() != 0x31) return null
         val headerSize = if (isV2) AUDIO_HEADER_V2_SIZE else AUDIO_HEADER_V1_SIZE
         if (length < headerSize) return null
-        val header = ByteBuffer.wrap(data, 0, headerSize).order(ByteOrder.BIG_ENDIAN)
-        header.position(4) // skip past the 4-byte magic
-        val codec = if (isV2) WireCodec.fromId(header.get().toInt()) else WireCodec.Pcm16
-        val seq = header.int.toLong() and 0xFFFF_FFFFL
-        val sampleRate = header.int
-        val channels = header.get().toInt()
-        val frames = header.short.toInt() and 0xFFFF
-        val payloadSize = header.int
-        val sendTimeNs = header.long
-        if (payloadSize <= 0 || headerSize + payloadSize > length) return null
+        // Parse the fixed header directly. This runs roughly once per 10 ms packet,
+        // so avoiding ByteBuffer wrappers reduces young-generation GC pressure.
+        var cursor = 4
+        val codec = if (isV2) WireCodec.fromId(data[cursor++].toInt() and 0xFF) else WireCodec.Pcm16
+        val seq = beInt(data, cursor).toLong() and 0xFFFF_FFFFL
+        cursor += 4
+        val sampleRate = beInt(data, cursor)
+        cursor += 4
+        val channels = data[cursor++].toInt() and 0xFF
+        val frames = beUShort(data, cursor)
+        cursor += 2
+        val payloadSize = beInt(data, cursor)
+        cursor += 4
+        val sendTimeNs = beLong(data, cursor)
+        if (channels != 2 || frames <= 0 || sampleRate !in 8_000..192_000) return null
+        if (payloadSize <= 0 || payloadSize > length - headerSize) return null
         return AudioPacket(seq, codec, sampleRate, channels, frames, sendTimeNs, data.copyOfRange(headerSize, headerSize + payloadSize), recvNs)
+    }
+
+    private fun beUShort(bytes: ByteArray, offset: Int): Int {
+        return ((bytes[offset].toInt() and 0xFF) shl 8) or
+            (bytes[offset + 1].toInt() and 0xFF)
+    }
+
+    private fun beInt(bytes: ByteArray, offset: Int): Int {
+        return ((bytes[offset].toInt() and 0xFF) shl 24) or
+            ((bytes[offset + 1].toInt() and 0xFF) shl 16) or
+            ((bytes[offset + 2].toInt() and 0xFF) shl 8) or
+            (bytes[offset + 3].toInt() and 0xFF)
+    }
+
+    private fun beLong(bytes: ByteArray, offset: Int): Long {
+        val high = beInt(bytes, offset).toLong() and 0xFFFF_FFFFL
+        val low = beInt(bytes, offset + 4).toLong() and 0xFFFF_FFFFL
+        return (high shl 32) or low
     }
 
     private fun fillReusableShorts(bytes: ByteArray): Int {
         val sampleCount = bytes.size / 2
         if (sampleCount > reusableShorts.size) {
-            reusableShorts = ShortArray(sampleCount * 2)
+            reusableShorts = ShortArray(maxOf(sampleCount, reusableShorts.size * 2))
         }
         var s = 0
         var b = 0
@@ -984,150 +1131,130 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         return sampleCount
     }
 
-    private fun decodePacket(packet: AudioPacket, deviceSampleRate: Int): ByteArray {
-        val decoded = when (packet.codec) {
-            WireCodec.Pcm16 -> packet.payload
-            WireCodec.Adpcm -> decodeAdpcm(packet.payload, packet.frames)
-            WireCodec.Mulaw -> decodeMulaw(packet.payload)
-            WireCodec.MulawLite -> decodeMulaw(packet.payload)
-            WireCodec.AdpcmLite -> decodeAdpcm(packet.payload, packet.frames)
-            WireCodec.Opus -> decodeOpus(packet)
-            WireCodec.Flac -> decodeFlac(packet.payload)
+    private fun decodePacket(packet: AudioPacket, deviceSampleRate: Int): ShortArray {
+        var decoded = when (packet.codec) {
+            WireCodec.Pcm16 -> {
+                decodedSampleCount = fillReusableShorts(packet.payload)
+                reusableShorts
+            }
+            WireCodec.Adpcm, WireCodec.AdpcmLite -> {
+                decodedSampleCount = decodeAdpcm(packet.payload, packet.frames)
+                reusableShorts
+            }
+            WireCodec.Mulaw, WireCodec.MulawLite -> {
+                decodedSampleCount = decodeMulaw(packet.payload)
+                reusableShorts
+            }
+            WireCodec.Opus -> {
+                decodedSampleCount = decodeOpus(packet)
+                opusOut
+            }
+            WireCodec.Flac -> {
+                decodedSampleCount = decodeFlac(
+                    packet.payload,
+                    packet.frames * packet.channels.coerceAtLeast(1),
+                )
+                flacOut
+            }
         }
         if (packet.sampleRate > 0 && packet.sampleRate < deviceSampleRate) {
             val scale = deviceSampleRate / packet.sampleRate
             if (scale == 2) {
-                upsampleBytes = reusableBytes(upsampleBytes, decoded.size * 2)
-                val upsampled = upsampleBytes
+                val channels = packet.channels.coerceAtLeast(1)
+                val needed = decodedSampleCount * 2
+                if (upsampleShorts.size < needed) {
+                    upsampleShorts = ShortArray(maxOf(needed, upsampleShorts.size * 2))
+                }
+                val upsampled = upsampleShorts
                 var src = 0
                 var dst = 0
-                while (src + 3 < decoded.size) {
-                    val b0 = decoded[src]
-                    val b1 = decoded[src + 1]
-                    val b2 = decoded[src + 2]
-                    val b3 = decoded[src + 3]
-                    
-                    // First copy
-                    upsampled[dst++] = b0
-                    upsampled[dst++] = b1
-                    upsampled[dst++] = b2
-                    upsampled[dst++] = b3
-                    
-                    // Second copy (upsample by 2)
-                    upsampled[dst++] = b0
-                    upsampled[dst++] = b1
-                    upsampled[dst++] = b2
-                    upsampled[dst++] = b3
-                    
-                    src += 4
+                while (src + channels <= decodedSampleCount) {
+                    repeat(2) {
+                        for (channel in 0 until channels) {
+                            upsampled[dst++] = decoded[src + channel]
+                        }
+                    }
+                    src += channels
                 }
-                // Reused buffer: zero any tail the loop didn't overwrite.
-                if (dst < upsampled.size) upsampled.fill(0, dst, upsampled.size)
-                return upsampled
+                decodedSampleCount = dst
+                decoded = upsampled
             }
         }
         return decoded
     }
 
-    private fun decodeOpus(packet: AudioPacket): ByteArray {
+    private fun decodeOpus(packet: AudioPacket): Int {
         val rate = packet.sampleRate.coerceAtLeast(8000)
         val decoder = opusDecoder ?: try {
             OpusDecoderWrapper(rate, 2).also { opusDecoder = it }
         } catch (_: Exception) {
-            return ByteArray(0)
+            return 0
         }
-        // Opus packets can hold up to 120 ms; size the output buffer for that.
-        val maxPerChannel = rate / 1000 * 120
+        // The sender puts the decoded frame count in the header. Use it instead of
+        // reserving Opus' theoretical 120 ms maximum for every 10 ms packet.
+        val maxPerChannel = packet.frames.coerceIn(1, rate * 120 / 1000)
         if (opusOut.size < maxPerChannel * 2) {
             opusOut = ShortArray(maxPerChannel * 2)
         }
         val perChannel = try {
             decoder.decode(packet.payload, packet.payload.size, opusOut, maxPerChannel, false)
         } catch (_: Exception) {
-            return ByteArray(0)
+            return 0
         }
-        val totalShorts = perChannel * 2
-        opusBytes = reusableBytes(opusBytes, totalShorts * 2)
-        val out = opusBytes
-        var o = 0
-        for (i in 0 until totalShorts) {
-            val s = opusOut[i].toInt()
-            out[o++] = (s and 0xFF).toByte()
-            out[o++] = ((s shr 8) and 0xFF).toByte()
-        }
-        return out
+        return perChannel * 2
     }
 
     // Opus packet loss concealment: ask the decoder to synthesise [count] missing
     // frames (passing null input triggers Opus PLC). Turns a dropped-packet gap into
     // a smooth interpolation instead of silence. Capped by the caller.
-    private fun concealOpus(frames: Int, count: Int): ByteArray {
+    private fun concealOpus(frames: Int, count: Int, track: AudioTrack): Int {
         val dec = opusDecoder
-        if (dec == null || count <= 0 || frames <= 0) return ByteArray(0)
+        if (dec == null || count <= 0 || frames <= 0) return 0
         val perFrameShorts = frames * 2
         if (opusOut.size < perFrameShorts) opusOut = ShortArray(perFrameShorts)
-        val out = ByteArray(count * perFrameShorts * 2)
-        var off = 0
+        var totalWritten = 0
         repeat(count) {
             val per = try {
                 dec.decode(null, 0, opusOut, frames, false)
             } catch (_: Exception) {
-                return if (off > 0) out.copyOf(off) else ByteArray(0)
+                return totalWritten
             }
-            var i = 0
-            val n = per * 2
-            while (i < n) {
-                val v = opusOut[i].toInt()
-                out[off++] = (v and 0xFF).toByte()
-                out[off++] = ((v shr 8) and 0xFF).toByte()
-                i++
-            }
+            totalWritten += writeFully(track, opusOut, per * 2)
         }
-        return if (off == out.size) out else out.copyOf(off)
+        return totalWritten
     }
 
     // Each FLAC packet is a complete, self-contained FLAC stream (header + one block).
     // The packaged native libFLAC decoder reuses one handle across packets.
     // Output is signed 16-bit LE stereo interleaved — exactly our PCM wire format.
-    private fun decodeFlac(payload: ByteArray): ByteArray {
+    private fun decodeFlac(payload: ByteArray, expectedSamples: Int): Int {
         if (NativeFlac.available) {
             if (flacHandle == 0L && !flacTriedInit) {
                 flacTriedInit = true
                 flacHandle = try { NativeFlac.nativeCreate() } catch (_: Throwable) { 0L }
             }
             if (flacHandle != 0L) {
-                // 8192 shorts = 4096 stereo frames, far above our 480-frame blocks.
-                if (flacOut.size < 8192) flacOut = ShortArray(8192)
+                val needed = expectedSamples.coerceAtLeast(2)
+                if (flacOut.size < needed) {
+                    flacOut = ShortArray(maxOf(needed, flacOut.size * 2))
+                }
                 val n = try {
                     NativeFlac.nativeDecode(flacHandle, payload, payload.size, flacOut, flacOut.size)
                 } catch (_: Throwable) { -1 }
-                if (n <= 0) return ByteArray(0)
-                flacBytes = reusableBytes(flacBytes, n * 2)
-                val bytes = flacBytes
-                var o = 0
-                var i = 0
-                while (i < n) {
-                    val s = flacOut[i].toInt()
-                    bytes[o++] = (s and 0xFF).toByte()
-                    bytes[o++] = ((s shr 8) and 0xFF).toByte()
-                    i++
-                }
-                return bytes
+                return n.coerceAtLeast(0)
             }
         }
-        return ByteArray(0)
+        return 0
     }
 
-    private fun decodeMulaw(payload: ByteArray): ByteArray {
-        mulawBytes = reusableBytes(mulawBytes, payload.size * 2)
-        val out = mulawBytes
-        var o = 0
-        for (byte in payload) {
-            val sample = mulawToLinear(byte.toInt() and 0xFF)
-            out[o++] = (sample.toInt() and 0xFF).toByte()
-            out[o++] = ((sample.toInt() shr 8) and 0xFF).toByte()
+    private fun decodeMulaw(payload: ByteArray): Int {
+        if (reusableShorts.size < payload.size) {
+            reusableShorts = ShortArray(maxOf(payload.size, reusableShorts.size * 2))
         }
-        return out
+        for (i in payload.indices) {
+            reusableShorts[i] = mulawToLinear(payload[i].toInt() and 0xFF)
+        }
+        return payload.size
     }
 
     private fun mulawToLinear(value: Int): Short {
@@ -1140,19 +1267,22 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         return (if (sign != 0) -sample else sample).toShort()
     }
 
-    private fun decodeAdpcm(payload: ByteArray, frames: Int): ByteArray {
-        if (payload.size < 6 || frames <= 0) return ByteArray(0)
+    private fun decodeAdpcm(payload: ByteArray, frames: Int): Int {
+        if (payload.size < 6 || frames <= 0) return 0
         var left = leShort(payload, 0).toInt()
         var leftIndex = payload[2].toInt().coerceIn(0, 88)
         var right = leShort(payload, 3).toInt()
         var rightIndex = payload[5].toInt().coerceIn(0, 88)
-        adpcmBytes = reusableBytes(adpcmBytes, frames * 4)
-        val out = adpcmBytes
-        writeShort(out, 0, left)
-        writeShort(out, 2, right)
-        var offset = 4
+        val samples = frames * 2
+        if (reusableShorts.size < samples) {
+            reusableShorts = ShortArray(maxOf(samples, reusableShorts.size * 2))
+        }
+        val out = reusableShorts
+        out[0] = left.toShort()
+        out[1] = right.toShort()
+        var offset = 2
         var i = 6
-        while (offset + 3 < out.size && i < payload.size) {
+        while (offset + 1 < samples && i < payload.size) {
             val packed = payload[i++].toInt() and 0xFF
             // Decode left then right in place. imaStep packs the new predictor and
             // step index into a single Long so the per-sample hot path allocates
@@ -1163,13 +1293,13 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             val r = imaStep((packed shr 4) and 0x0F, right, rightIndex)
             right = r.toInt()
             rightIndex = (r shr 32).toInt()
-            writeShort(out, offset, left)
-            writeShort(out, offset + 2, right)
-            offset += 4
+            out[offset] = left.toShort()
+            out[offset + 1] = right.toShort()
+            offset += 2
         }
         // Reused buffer: zero any tail a truncated payload didn't overwrite.
-        if (offset < out.size) out.fill(0, offset, out.size)
-        return out
+        if (offset < samples) out.fill(0, offset, samples)
+        return samples
     }
 
     // Returns the next predictor (low 32 bits) and step index (high 32 bits) packed
@@ -1189,23 +1319,55 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         return ((bytes[offset].toInt() and 0xFF) or (bytes[offset + 1].toInt() shl 8)).toShort()
     }
 
-    private fun writeShort(bytes: ByteArray, offset: Int, value: Int) {
-        bytes[offset] = (value and 0xFF).toByte()
-        bytes[offset + 1] = ((value shr 8) and 0xFF).toByte()
+    private fun writeFully(track: AudioTrack, pcm: ShortArray, sampleCount: Int): Int {
+        var offset = 0
+        var zeroWrites = 0
+        while (offset < sampleCount) {
+            val remaining = sampleCount - offset
+            val result = track.write(
+                pcm,
+                offset,
+                remaining,
+                AudioTrack.WRITE_BLOCKING,
+            )
+            if (result < 0) {
+                Log.e("SoundMirrorPerf", "AudioTrack.write failed: $result")
+                throw IllegalStateException("AudioTrack.write failed: $result")
+            }
+            if (result == 0) {
+                // A blocking write should not return zero, but bound the retry so a
+                // broken track cannot busy-spin forever on the urgent-audio thread.
+                zeroWrites += 1
+                if (zeroWrites >= 3) {
+                    Log.e("SoundMirrorPerf", "AudioTrack.write repeatedly returned 0")
+                    throw IllegalStateException("AudioTrack.write repeatedly returned 0")
+                }
+                Thread.yield()
+                continue
+            }
+            if (result < remaining) {
+                val now = System.currentTimeMillis()
+                if (now - lastPartialWriteLogMs >= 5000) {
+                    lastPartialWriteLogMs = now
+                    Log.d("SoundMirrorPerf", "AudioTrack partial write: $result/$remaining samples")
+                }
+            }
+            offset += result
+            zeroWrites = 0
+        }
+        return offset
     }
 
-    private fun pcmAmplitude(payload: ByteArray): Float {
-        if (payload.size < 2) return 0f
+    private fun pcmAmplitude(payload: ShortArray, sampleCount: Int): Float {
+        if (sampleCount <= 0) return 0f
         var sum = 0.0
-        var samples = 0
         var i = 0
-        while (i + 1 < payload.size) {
-            val value = ((payload[i + 1].toInt() shl 8) or (payload[i].toInt() and 0xFF)).toShort().toInt()
+        while (i < sampleCount) {
+            val value = payload[i].toInt()
             sum += value.toDouble() * value.toDouble()
-            samples += 1
-            i += 2
+            i += 1
         }
-        return (sqrt(sum / samples) / 32768.0).toFloat().coerceIn(0f, 1f)
+        return (sqrt(sum / sampleCount) / 32768.0).toFloat().coerceIn(0f, 1f)
     }
 }
 
@@ -1219,7 +1381,15 @@ private enum class WireCodec(val id: Int, val displayName: String, val displayBi
     Flac(6, "FLAC 무손실", "자동 (가변)");
 
     companion object {
-        fun fromId(id: Int): WireCodec = values().firstOrNull { it.id == id } ?: Pcm16
+        fun fromId(id: Int): WireCodec = when (id) {
+            1 -> Adpcm
+            2 -> Mulaw
+            3 -> MulawLite
+            4 -> AdpcmLite
+            5 -> Opus
+            6 -> Flac
+            else -> Pcm16
+        }
     }
 }
 
@@ -1458,11 +1628,11 @@ private fun PlaybackStabilityPanel(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("상태 갱신 주기", color = Color(0xFF394150), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text("상태 측정 주기", color = Color(0xFF394150), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             Text(STATS_REFRESH_LABELS[statsRefreshIndex], color = Color(0xFF007AFF), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         }
         Text(
-            "갱신 간격을 길게 하거나 정적으로 설정하면 화면 처리량이 줄어 배터리 절약에 유리합니다.",
+            "지연·지터·유실·수신률 수치의 측정 간격입니다. 오디오 시각화와 재생 처리는 영향을 받지 않습니다.",
             color = Color(0xFF8A94A6),
             fontSize = 12.sp,
         )
@@ -1549,15 +1719,20 @@ private fun ConnectionHero(
             }
         }
         Box(modifier = Modifier.fillMaxWidth().height(150.dp), contentAlignment = Alignment.Center) {
-            OrbitalVisualizer(
-                connected = stats.connected,
-                amplitude = stats.amplitude,
-            )
+            RealtimeAudioVisualizer(connected = stats.connected)
         }
         AnimatedVisibility(visible = stats.connected, enter = fadeIn(), exit = fadeOut()) {
             ConnectedStatsPanel(stats = stats, settings = settings)
         }
     }
+}
+
+@Composable
+private fun RealtimeAudioVisualizer(connected: Boolean) {
+    // Keep the frequently changing audio level read in this narrow composition scope,
+    // so the connection card and numeric stats do not recompose at meter speed.
+    val amplitude by PlaybackController.audioLevel.collectAsStateWithLifecycle()
+    OrbitalVisualizer(connected = connected, amplitude = amplitude)
 }
 
 @Composable
@@ -1834,13 +2009,20 @@ private fun OrbitalVisualizer(
     connected: Boolean,
     amplitude: Float,
 ) {
-    val transition = rememberInfiniteTransition(label = "visual")
-    val pulse by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "pulse",
-    )
+    // Connected audio level already updates at 20 Hz. A second perpetual animation
+    // would keep rendering near 60 fps, so retain it only for the idle screen.
+    val pulse = if (connected) {
+        0f
+    } else {
+        val transition = rememberInfiniteTransition(label = "visual")
+        val idlePulse by transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "pulse",
+        )
+        idlePulse
+    }
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -1853,11 +2035,7 @@ private fun OrbitalVisualizer(
 
 @Composable
 private fun CentralTarget(connected: Boolean, amplitude: Float, pulse: Float) {
-    val ringAmp by animateFloatAsState(
-        targetValue = if (connected) amplitude else 0.08f + pulse * 0.04f,
-        animationSpec = tween(120),
-        label = "ring-amp",
-    )
+    val ringAmp = if (connected) amplitude else 0.08f + pulse * 0.04f
     Box(modifier = Modifier.size(130.dp), contentAlignment = Alignment.Center) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             val center = Offset(size.width / 2f, size.height / 2f)

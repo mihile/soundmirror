@@ -51,10 +51,15 @@ object PlaybackController {
     @Volatile private var wifiSaverActive = false
 
     private val idleStats = MutableStateFlow(StreamStats())
+    private val idleAudioLevel = MutableStateFlow(0f)
 
     /** Stable stats flow for the UI. Safe to read before [ensureInit]. */
     val stats: StateFlow<StreamStats>
         get() = client?.stats ?: idleStats.asStateFlow()
+
+    /** Fast, lightweight state used only by the audio-reactive visualizer. */
+    val audioLevel: StateFlow<Float>
+        get() = client?.audioLevel ?: idleAudioLevel.asStateFlow()
 
     /** Call once (e.g. from Activity.onCreate) before observing [stats]. */
     fun ensureInit(context: Context) {
@@ -207,7 +212,11 @@ class PlaybackService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        return START_STICKY
+        // PlaybackController keeps the actual stream only in this process. If Android
+        // kills it there is no session state to restore from a null restart intent, so
+        // START_STICKY would create a foreground "playing" service with no audio or
+        // locks. A fresh user connection starts the service again normally.
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {

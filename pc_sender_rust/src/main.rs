@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::net::{SocketAddrV4, UdpSocket};
 
 use audiopus::{Application, Bitrate, Channels, SampleRate, coder::Encoder as OpusEncoder};
-use std::sync::{Mutex, LazyLock, RwLock};
+use std::sync::{Mutex, LazyLock, OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -23,7 +23,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, ShowWindow, SetForegroundWindow, SW_HIDE,
+    FindWindowW, IsIconic, ShowWindow, SetForegroundWindow, SW_HIDE, SW_MINIMIZE,
     GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, SW_RESTORE,
     GetWindowLongW, SetWindowLongW,
 };
@@ -85,8 +85,19 @@ struct ClientEndpoint {
 }
 
 static CLIENTS: LazyLock<Mutex<Vec<Client>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+// Incremented only when the endpoint/codec snapshot used by the audio thread changes.
+// Keepalive-only updates still refresh `seen`, but no longer force the real-time thread
+// to take CLIENTS' mutex for every capture packet.
+static CLIENTS_GENERATION: AtomicU32 = AtomicU32::new(1);
 static RUNNING: AtomicBool = AtomicBool::new(true);
 static SHOW_WINDOW_FLAG: AtomicBool = AtomicBool::new(false);
+// eframe 0.26 on Windows busy-polls RedrawWindow when a repaint deadline expires
+// while the native window is invisible. Store the context so tray/menu events can
+// wake it only after making the window visible; hidden mode schedules no repaints.
+static GUI_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+// RMS is display-only work. The capture thread skips it completely while the GUI is
+// in the tray and limits it to the visualizer's useful cadence while it is visible.
+static GUI_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 // Shareable real-time audio statistics for GUI
 static CURRENT_AMPLITUDE: AtomicU32 = AtomicU32::new(0);
@@ -264,14 +275,17 @@ fn add_client(addr: SocketAddrV4, codec: u8, opus_bitrate_bps: i32) {
     let mut clients = CLIENTS.lock().unwrap();
     let mut is_new = true;
     let mut codec_changed = false;
+    let mut endpoint_changed = false;
 
     for client in clients.iter_mut() {
         if client.addr.ip() == addr.ip() {
             client.seen = now;
+            endpoint_changed |= client.addr != addr;
             client.addr = addr;
             if client.codec != codec {
                 codec_changed = true;
             }
+            endpoint_changed |= client.codec != codec || client.opus_bitrate_bps != opus_bitrate_bps;
             client.codec = codec;
             client.opus_bitrate_bps = opus_bitrate_bps;
             is_new = false;
@@ -281,13 +295,17 @@ fn add_client(addr: SocketAddrV4, codec: u8, opus_bitrate_bps: i32) {
 
     if is_new {
         clients.push(Client { addr, seen: now, codec, opus_bitrate_bps });
+        endpoint_changed = true;
         println!("Client [{}:{}] connected with codec: {}", addr.ip(), addr.port(), codec_name);
     } else if codec_changed {
         println!("Client [{}:{}] changed codec to: {}", addr.ip(), addr.port(), codec_name);
     }
+    if endpoint_changed {
+        CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
+    }
 }
 
-fn refresh_clients_snapshot(snapshot: &mut Vec<ClientEndpoint>) {
+fn refresh_clients_snapshot(snapshot: &mut Vec<ClientEndpoint>) -> u32 {
     let now = Instant::now();
     let mut clients = CLIENTS.lock().unwrap();
     // Keep a client registered for 30s of silence. When the phone's screen is off,
@@ -296,13 +314,22 @@ fn refresh_clients_snapshot(snapshot: &mut Vec<ClientEndpoint>) {
     // round-trip (~10s audible gap). 30s rides through those power-save windows so
     // playback resumes the instant the radio wakes, while still dropping a client
     // that has genuinely gone away within a reasonable time.
+    let old_len = clients.len();
     clients.retain(|client| now.duration_since(client.seen).as_secs() <= 30);
+    if clients.len() != old_len {
+        CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
+    }
     snapshot.clear();
     snapshot.extend(clients.iter().map(|client| ClientEndpoint {
             addr: client.addr,
             codec: client.codec,
             opus_bitrate_bps: client.opus_bitrate_bps,
         }));
+    // Capture the generation while CLIENTS is still locked. If add_client() changes
+    // the list immediately after this function returns, its generation increment can
+    // no longer be mistaken for the snapshot we just built; the audio loop will see
+    // the mismatch on its next packet instead of waiting for 1 s housekeeping.
+    CLIENTS_GENERATION.load(Ordering::Acquire)
 }
 
 fn clients_snapshot() -> Vec<ClientEndpoint> {
@@ -523,6 +550,9 @@ impl OpusClientState {
         let encoder = SampleRate::try_from(sample_rate as i32).ok().and_then(|sr| {
             let mut enc = OpusEncoder::new(sr, Channels::Stereo, Application::Audio).ok()?;
             let _ = enc.set_bitrate(Bitrate::BitsPerSecond(bitrate_bps));
+            // Complexity 7 preserves the same bitrate/FEC/10 ms framing while leaving
+            // substantially more deadline headroom on the real-time capture thread.
+            let _ = enc.set_complexity(7);
             let _ = enc.set_inband_fec(true);
             let _ = enc.set_packet_loss_perc(8);
             Some(enc)
@@ -549,10 +579,13 @@ impl OpusClientState {
     }
 }
 
-fn pcm_bytes_to_i16(pcm: &[u8]) -> Vec<i16> {
-    pcm.chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
+fn pcm_bytes_to_i16(pcm: &[u8], out: &mut Vec<i16>) {
+    out.clear();
+    out.reserve(pcm.len() / 2);
+    out.extend(
+        pcm.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]])),
+    );
 }
 
 // Per-client FLAC state. FLAC is lossless: identical quality to PCM16 at roughly half
@@ -606,8 +639,9 @@ fn encode_flac(frame_i16: &[i16], frames_per_channel: usize, sample_rate: u32) -
 // frame (pure decimation, which folds high frequencies back as audible aliasing),
 // average each adjacent stereo frame pair as a cheap 2-tap low-pass before
 // decimating. This noticeably reduces the metallic/harsh artefacts on lite modes.
-fn downsample_half(pcm: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() / 2);
+fn downsample_half(pcm: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(pcm.len() / 2);
     for chunk in pcm.chunks_exact(8) {
         let l0 = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
         let r0 = i16::from_le_bytes([chunk[2], chunk[3]]) as i32;
@@ -618,7 +652,6 @@ fn downsample_half(pcm: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&l.to_le_bytes());
         out.extend_from_slice(&r.to_le_bytes());
     }
-    out
 }
 
 fn encode_adpcm(pcm: &[u8], frames: u32, state: &mut AdpcmState) -> Vec<u8> {
@@ -642,8 +675,9 @@ fn encode_adpcm(pcm: &[u8], frames: u32, state: &mut AdpcmState) -> Vec<u8> {
     out
 }
 
-fn build_packet(seq: u32, sample_rate: u32, frames: u16, codec: u8, payload: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(28 + payload.len());
+fn build_packet(seq: u32, sample_rate: u32, frames: u16, codec: u8, payload: &[u8], packet: &mut Vec<u8>) {
+    packet.clear();
+    packet.reserve(28 + payload.len());
     packet.extend_from_slice(b"SMA2");
     packet.push(codec);
     packet.extend_from_slice(&seq.to_be_bytes());
@@ -659,7 +693,6 @@ fn build_packet(seq: u32, sample_rate: u32, frames: u16, codec: u8, payload: &[u
     packet.extend_from_slice(&now_ns.to_be_bytes());
     
     packet.extend_from_slice(payload);
-    packet
 }
 
 #[derive(serde::Serialize)]
@@ -828,7 +861,9 @@ fn control_loop() {
         match socket.recv_from(&mut buffer) {
             Ok((n, from)) => {
                 if let Ok(text) = std::str::from_utf8(&buffer[..n]) {
-                    if text.starts_with("SM_CONNECT") {
+                    if text == "SM_SHOW_GUI" && from.ip().is_loopback() {
+                        request_gui_show();
+                    } else if text.starts_with("SM_CONNECT") {
                         let ip = from.ip();
                         let client_addr = SocketAddrV4::new(
                             match ip {
@@ -940,7 +975,16 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
     let mut client_seqs: HashMap<SocketAddrV4, u32> = HashMap::new();
     let mut opus_out = [0u8; 4000];
     let mut pcm_data = Vec::new();
+    let mut pcm_i16 = Vec::new();
+    let mut lite_payload = Vec::new();
+    let mut packet_scratch = Vec::with_capacity(4096);
+    let mut flac_fallback_pcm = Vec::new();
     let mut active_clients = Vec::with_capacity(4);
+    let mut clients_generation = refresh_clients_snapshot(&mut active_clients);
+    let mut last_clients_refresh = Instant::now();
+    let mut last_amplitude_update = Instant::now()
+        .checked_sub(Duration::from_millis(40))
+        .unwrap_or_else(Instant::now);
     // Counts consecutive capture-client errors. If the default endpoint's format
     // changes or the device is invalidated (e.g. an app starts audio at a different
     // rate, spatial sound toggles, a USB/BT device connects), the loopback client
@@ -973,7 +1017,6 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-
             // No event and nothing pending: genuinely idle/silent, just wait again.
             if wait_result != WAIT_OBJECT_0 && packet_size == 0 {
                 continue;
@@ -985,30 +1028,61 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                 let mut flags = 0u32;
                 
                 if capture_client.GetBuffer(&mut data_ptr, &mut frames, &mut flags, None, None).is_ok() {
-                    let data_len = frames as usize * mix_format.nBlockAlign as usize;
-                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
-                        pcm_data.clear();
-                        pcm_data.resize(frames as usize * 4, 0);
-                    } else {
-                        let raw_slice = std::slice::from_raw_parts(data_ptr, data_len);
-                        convert_to_stereo_i16(raw_slice, frames, mix_format, &mut pcm_data);
+                    // Refresh immediately on endpoint/codec changes and otherwise once
+                    // per second for exact timeout pruning. In the steady state this is
+                    // just an atomic load rather than a mutex acquisition per packet.
+                    let current_generation = CLIENTS_GENERATION.load(Ordering::Acquire);
+                    let snapshot_refreshed = current_generation != clients_generation
+                        || last_clients_refresh.elapsed() >= Duration::from_secs(1);
+                    if snapshot_refreshed {
+                        clients_generation = refresh_clients_snapshot(&mut active_clients);
+                        last_clients_refresh = Instant::now();
+
+                        // Encoder cleanup follows client snapshot housekeeping instead
+                        // of scanning every map on every 5 ms capture packet.
+                        adpcm_states.retain(|addr, _| {
+                            active_clients
+                                .iter()
+                                .any(|c| &c.addr == addr && (c.codec == 1 || c.codec == 4))
+                        });
+                        opus_states.retain(|addr, _| {
+                            active_clients.iter().any(|c| &c.addr == addr && c.codec == 5)
+                        });
+                        flac_states.retain(|addr, _| {
+                            active_clients.iter().any(|c| &c.addr == addr && c.codec == 6)
+                        });
+                        client_seqs.retain(|addr, _| active_clients.iter().any(|c| &c.addr == addr));
                     }
-                    
-                    // Measure and store current audio amplitude (RMS) for GUI Visualizer
-                    let amp = calculate_amplitude(&pcm_data);
-                    set_current_amplitude(amp);
-                    
+
+                    let measure_amplitude = GUI_VISIBLE.load(Ordering::Relaxed)
+                        && last_amplitude_update.elapsed() >= Duration::from_millis(40);
+                    let needs_pcm = !active_clients.is_empty() || measure_amplitude;
+                    if needs_pcm {
+                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
+                            pcm_data.clear();
+                            pcm_data.resize(frames as usize * 4, 0);
+                        } else {
+                            let data_len = frames as usize * mix_format.nBlockAlign as usize;
+                            let raw_slice = std::slice::from_raw_parts(data_ptr, data_len);
+                            convert_to_stereo_i16(raw_slice, frames, mix_format, &mut pcm_data);
+                        }
+
+                        if measure_amplitude {
+                            set_current_amplitude(calculate_amplitude(&pcm_data));
+                            last_amplitude_update = Instant::now();
+                        }
+                    }
+
                     let _ = capture_client.ReleaseBuffer(frames);
-                    
-                    refresh_clients_snapshot(&mut active_clients);
+
                     let clients = &active_clients;
 
+                    if !clients.is_empty() {
+
                     // Precompute the half-rate payload once; all "lite" clients share it.
-                    let lite_payload = if clients.iter().any(|c| c.codec == 3 || c.codec == 4) {
-                        downsample_half(&pcm_data)
-                    } else {
-                        Vec::new()
-                    };
+                    if clients.iter().any(|c| c.codec == 3 || c.codec == 4) {
+                        downsample_half(&pcm_data, &mut lite_payload);
+                    }
 
                     // Stateless / per-packet codecs (PCM16, ADPCM, MULAW + lite).
                     for client in clients {
@@ -1027,14 +1101,14 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                                     .entry(client.addr)
                                     .or_insert(AdpcmState { left_index: 0, right_index: 0 });
                                 let encoded = encode_adpcm(processed_payload, target_frames, state);
-                                let packet = build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded);
-                                let _ = out_socket.send_to(&packet, client.addr);
+                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded, &mut packet_scratch);
+                                let _ = out_socket.send_to(&packet_scratch, client.addr);
                                 *client_seq = client_seq.wrapping_add(1);
                             }
                             2 | 3 => {
                                 let encoded = encode_mulaw(processed_payload);
-                                let packet = build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded);
-                                let _ = out_socket.send_to(&packet, client.addr);
+                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded, &mut packet_scratch);
+                                let _ = out_socket.send_to(&packet_scratch, client.addr);
                                 *client_seq = client_seq.wrapping_add(1);
                             }
                             _ => {
@@ -1047,8 +1121,8 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                                 while start < total {
                                     let count = (total - start).min(MAX_PCM_FRAMES);
                                     let chunk = &processed_payload[start * 4..(start + count) * 4];
-                                    let packet = build_packet(*client_seq, target_sample_rate, count as u16, 0, chunk);
-                                    let _ = out_socket.send_to(&packet, client.addr);
+                                    build_packet(*client_seq, target_sample_rate, count as u16, 0, chunk, &mut packet_scratch);
+                                    let _ = out_socket.send_to(&packet_scratch, client.addr);
                                     *client_seq = client_seq.wrapping_add(1);
                                     start += count;
                                 }
@@ -1058,8 +1132,13 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Opus clients: accumulate into fixed 10 ms frames, encode, send.
                     let has_opus = clients.iter().any(|c| c.codec == 5);
+                    let has_flac = clients.iter().any(|c| c.codec == 6);
+                    // Opus and FLAC consume the same interleaved samples. Convert once
+                    // into a reusable scratch vector even when both codecs are active.
+                    if has_opus || has_flac {
+                        pcm_bytes_to_i16(&pcm_data, &mut pcm_i16);
+                    }
                     if has_opus {
-                        let samples = pcm_bytes_to_i16(&pcm_data);
                         for client in clients.iter().filter(|c| c.codec == 5) {
                             let state = opus_states
                                 .entry(client.addr)
@@ -1068,28 +1147,28 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                             let client_seq = client_seqs.entry(client.addr).or_insert(0);
                             match state.encoder.as_ref() {
                                 Some(enc) => {
-                                    state.accum.extend(samples.iter().copied());
+                                    state.accum.extend(pcm_i16.iter().copied());
                                     while state.accum.len() >= state.frame_total_samples {
                                         state.frame.clear();
                                         state.frame.extend(state.accum.drain(0..state.frame_total_samples));
                                         if let Ok(n) = enc.encode(&state.frame, &mut opus_out) {
-                                            let packet = build_packet(
+                                            build_packet(
                                                 *client_seq,
                                                 sample_rate,
                                                 state.frame_per_channel,
                                                 5,
                                                 &opus_out[..n],
+                                                &mut packet_scratch,
                                             );
-                                            let _ = out_socket.send_to(&packet, client.addr);
+                                            let _ = out_socket.send_to(&packet_scratch, client.addr);
                                             *client_seq = client_seq.wrapping_add(1);
                                         }
                                     }
                                 }
                                 None => {
                                     // Capture rate not supported by Opus — fall back to PCM16.
-                                    let packet =
-                                        build_packet(*client_seq, sample_rate, frames as u16, 0, &pcm_data);
-                                    let _ = out_socket.send_to(&packet, client.addr);
+                                    build_packet(*client_seq, sample_rate, frames as u16, 0, &pcm_data, &mut packet_scratch);
+                                    let _ = out_socket.send_to(&packet_scratch, client.addr);
                                     *client_seq = client_seq.wrapping_add(1);
                                 }
                             }
@@ -1099,44 +1178,45 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                     // FLAC clients: accumulate into fixed 10 ms blocks, encode each as a
                     // standalone lossless stream, send. Falls back to PCM16 if a block
                     // fails to encode (so audio never drops out).
-                    let has_flac = clients.iter().any(|c| c.codec == 6);
                     if has_flac {
-                        let samples = pcm_bytes_to_i16(&pcm_data);
                         for client in clients.iter().filter(|c| c.codec == 6) {
                             let state = flac_states
                                 .entry(client.addr)
                                 .or_insert_with(|| FlacClientState::new(sample_rate));
                             let client_seq = client_seqs.entry(client.addr).or_insert(0);
-                            state.accum.extend(samples.iter().copied());
+                            state.accum.extend(pcm_i16.iter().copied());
                             while state.accum.len() >= state.frame_total_samples {
                                 state.frame.clear();
                                 state.frame.extend(state.accum.drain(0..state.frame_total_samples));
                                 match encode_flac(&state.frame, state.frame_per_channel as usize, sample_rate) {
                                     Some(encoded) => {
-                                        let packet = build_packet(
+                                        build_packet(
                                             *client_seq,
                                             sample_rate,
                                             state.frame_per_channel,
                                             6,
                                             &encoded,
+                                            &mut packet_scratch,
                                         );
-                                        let _ = out_socket.send_to(&packet, client.addr);
+                                        let _ = out_socket.send_to(&packet_scratch, client.addr);
                                     }
                                     None => {
                                         // Encode failed — send the raw block as PCM16 so
                                         // the listener hears it regardless.
-                                        let mut raw = Vec::with_capacity(state.frame.len() * 2);
+                                        flac_fallback_pcm.clear();
+                                        flac_fallback_pcm.reserve(state.frame.len() * 2);
                                         for s in &state.frame {
-                                            raw.extend_from_slice(&s.to_le_bytes());
+                                            flac_fallback_pcm.extend_from_slice(&s.to_le_bytes());
                                         }
-                                        let packet = build_packet(
+                                        build_packet(
                                             *client_seq,
                                             sample_rate,
                                             state.frame_per_channel,
                                             0,
-                                            &raw,
+                                            &flac_fallback_pcm,
+                                            &mut packet_scratch,
                                         );
-                                        let _ = out_socket.send_to(&packet, client.addr);
+                                        let _ = out_socket.send_to(&packet_scratch, client.addr);
                                     }
                                 }
                                 *client_seq = client_seq.wrapping_add(1);
@@ -1144,18 +1224,6 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Drop encoder state for clients that have disconnected.
-                    if !adpcm_states.is_empty() {
-                        adpcm_states.retain(|addr, _| clients.iter().any(|c| &c.addr == addr));
-                    }
-                    if !opus_states.is_empty() {
-                        opus_states.retain(|addr, _| clients.iter().any(|c| &c.addr == addr));
-                    }
-                    if !flac_states.is_empty() {
-                        flac_states.retain(|addr, _| clients.iter().any(|c| &c.addr == addr));
-                    }
-                    if !client_seqs.is_empty() {
-                        client_seqs.retain(|addr, _| clients.iter().any(|c| &c.addr == addr));
                     }
                 } else {
                     // Couldn't acquire the capture buffer — stop spinning and let the
@@ -1182,7 +1250,7 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Native Win32 window management for reliable tray hide/show
-fn native_hide_window() {
+fn native_minimize_to_tray() {
     let title: Vec<u16> = "SoundMirror PC Sender\0".encode_utf16().collect();
     unsafe {
         let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr()));
@@ -1193,8 +1261,11 @@ fn native_hide_window() {
             style |= WS_EX_TOOLWINDOW.0 as i32;
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, style);
 
-            // Fully hide the window. Minimizing leaves a taskbar button behind.
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            // Keep the native window minimized instead of Visible(false). eframe 0.26
+            // excludes minimized windows from redraw scheduling, while an invisible
+            // window with an expired repaint deadline busy-spins RedrawWindow. The
+            // TOOLWINDOW style above keeps this minimized window off the taskbar/Alt-Tab.
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
         }
     }
 }
@@ -1217,6 +1288,34 @@ fn native_show_window() {
     }
 }
 
+fn request_gui_show() {
+    SHOW_WINDOW_FLAG.store(true, Ordering::Release);
+    // The native window must be visible before request_repaint(): eframe 0.26's
+    // Windows runner otherwise turns an expired invisible-window deadline into a
+    // RedrawWindow busy-loop.
+    GUI_VISIBLE.store(true, Ordering::Release);
+    native_show_window();
+    if let Some(ctx) = GUI_CONTEXT.get() {
+        ctx.request_repaint();
+    }
+}
+
+fn hide_window_with_followup() {
+    native_minimize_to_tray();
+    // winit can briefly restore APPWINDOW after a minimize/close transition. Do the
+    // two rare follow-up corrections on a short-lived helper instead of waking the
+    // invisible eframe viewport and burning a core indefinitely.
+    thread::spawn(|| {
+        for delay_ms in [50, 150] {
+            thread::sleep(Duration::from_millis(delay_ms));
+            if GUI_VISIBLE.load(Ordering::Acquire) {
+                break;
+            }
+            native_minimize_to_tray();
+        }
+    });
+}
+
 fn native_window_is_minimized() -> bool {
     let title: Vec<u16> = "SoundMirror PC Sender\0".encode_utf16().collect();
     unsafe {
@@ -1229,7 +1328,7 @@ fn native_window_is_minimized() -> bool {
 struct SoundMirrorApp {
     autostart: bool,
     show_window: bool,
-    startup_frames: u8,
+    startup_hidden: bool,
 }
 
 fn setup_custom_fonts(ctx: &egui::Context) {
@@ -1254,6 +1353,7 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 
 impl SoundMirrorApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let _ = GUI_CONTEXT.set(cc.egui_ctx.clone());
         setup_custom_fonts(&cc.egui_ctx);
 
         // Apply Premium Light Mode Styles to egui Context (Matching Android App)
@@ -1270,30 +1370,30 @@ impl SoundMirrorApp {
         Self {
             autostart: is_autostart_enabled(),
             show_window: false,
-            startup_frames: 0,
+            startup_hidden: false,
         }
     }
 }
 
 impl eframe::App for SoundMirrorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Startup: render 2 frames offscreen then minimize to tray immediately
-        if self.startup_frames < 2 {
-            self.startup_frames += 1;
-            if self.startup_frames == 2 {
-                self.show_window = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                native_hide_window();
-            }
-            ctx.request_repaint();
+        // NativeOptions starts invisible. Never schedule a repaint while invisible:
+        // eframe 0.26 cannot receive RedrawRequested for that window and otherwise
+        // spins NtUserRedrawWindow at one full CPU core.
+        if !self.startup_hidden {
+            self.startup_hidden = true;
+            self.show_window = false;
+            GUI_VISIBLE.store(false, Ordering::Release);
+            hide_window_with_followup();
+            return;
         }
 
         // Intercept viewport close request — hide to tray via native Win32 API
         if ctx.input(|i: &egui::InputState| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.show_window = false;
-            native_hide_window();
+            GUI_VISIBLE.store(false, Ordering::Release);
+            hide_window_with_followup();
         }
 
         // Treat the title-bar minimize button as "send to tray" as well.
@@ -1301,25 +1401,19 @@ impl eframe::App for SoundMirrorApp {
             (ctx.input(|i| i.viewport().minimized == Some(true)) || native_window_is_minimized())
         {
             self.show_window = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            native_hide_window();
+            GUI_VISIBLE.store(false, Ordering::Release);
+            hide_window_with_followup();
         }
 
         // Check if background thread requested window show (tray click / menu "open")
-        if SHOW_WINDOW_FLAG.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if SHOW_WINDOW_FLAG.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             self.show_window = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            native_show_window();
+            GUI_VISIBLE.store(true, Ordering::Release);
         }
 
-        // If the window is hidden, keep polling the flag
+        // Hidden mode is fully event-driven. Tray/menu handlers make the native
+        // window visible first and then wake this context exactly once.
         if !self.show_window {
-            // winit may restore APPWINDOW after processing a minimize event. Keep
-            // enforcing the hidden/tool-window state while the app lives in the tray.
-            native_hide_window();
-            ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
 
@@ -1532,7 +1626,11 @@ fn main() {
         .map(|code| code == ERROR_ALREADY_EXISTS)
         .unwrap_or(false);
     if already_running {
-        native_show_window();
+        // Ask the primary process to update its own UI state as well as the native
+        // window. A direct ShowWindow here would leave its show_window flag false.
+        if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
+            let _ = socket.send_to(b"SM_SHOW_GUI", ("127.0.0.1", CONTROL_PORT));
+        }
         std::process::exit(0);
     }
 
@@ -1577,8 +1675,7 @@ fn main() {
     thread::spawn(|| {
         while let Ok(event) = TrayIconEvent::receiver().recv() {
             if let TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. } = event {
-                SHOW_WINDOW_FLAG.store(true, Ordering::SeqCst);
-                native_show_window();
+                request_gui_show();
             }
         }
     });
@@ -1586,8 +1683,7 @@ fn main() {
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
             if event.id == "open" {
-                SHOW_WINDOW_FLAG.store(true, Ordering::SeqCst);
-                native_show_window();
+                request_gui_show();
             } else if event.id == "exit" {
                 RUNNING.store(false, Ordering::Relaxed);
                 std::process::exit(0);
