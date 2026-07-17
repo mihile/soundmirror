@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "soundmirror_sender_rust"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "audiopus",
  "eframe",
