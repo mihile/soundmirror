@@ -95,15 +95,19 @@ static SHOW_WINDOW_FLAG: AtomicBool = AtomicBool::new(false);
 // while the native window is invisible. Store the context so tray/menu events can
 // wake it only after making the window visible; hidden mode schedules no repaints.
 static GUI_CONTEXT: OnceLock<egui::Context> = OnceLock::new();
-// RMS is display-only work. The capture thread skips it completely while the GUI is
-// in the tray and limits it to the visualizer's useful cadence while it is visible.
+// Tracks whether the GUI is visible so the native window watcher can use a fast
+// cadence only while the user is interacting with it.
 static GUI_VISIBLE: AtomicBool = AtomicBool::new(false);
+// App-local transmit volume. WASAPI loopback can be independent of the Windows
+// endpoint volume, so scale the shared PCM once before any codec encodes it.
+// Keeping this as an atomic lets the GUI update it without locking the real-time
+// capture thread or restarting the stream.
+static OUTPUT_VOLUME_PERCENT: AtomicU32 = AtomicU32::new(100);
 // Serialize native hide/show transitions. The minimize watcher and tray handlers run
 // on different threads and must not restore and re-hide the same HWND out of order.
 static WINDOW_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-// Shareable real-time audio statistics for GUI
-static CURRENT_AMPLITUDE: AtomicU32 = AtomicU32::new(0);
+// Shareable audio information for GUI
 static ACTIVE_DEVICE_NAME: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("Default Output".to_string()));
 static ACTIVE_SAMPLE_RATE: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0));
 // Cached primary IPv4 so the GUI thread never opens a socket per repaint frame.
@@ -111,12 +115,12 @@ static LOCAL_IP: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("127.0.
 // Signals the audio loop to restart capture when the default render device changes.
 static DEVICE_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn set_current_amplitude(amp: f32) {
-    CURRENT_AMPLITUDE.store(amp.to_bits(), Ordering::Relaxed);
+fn set_output_volume_percent(percent: u32) {
+    OUTPUT_VOLUME_PERCENT.store(percent.min(200), Ordering::Relaxed);
 }
 
-fn get_current_amplitude() -> f32 {
-    f32::from_bits(CURRENT_AMPLITUDE.load(Ordering::Relaxed))
+fn get_output_volume_percent() -> u32 {
+    OUTPUT_VOLUME_PERCENT.load(Ordering::Relaxed)
 }
 
 fn set_active_device_info(name: String, rate: u32) {
@@ -220,6 +224,22 @@ fn set_autostart(enabled: bool) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn load_output_volume_percent() -> u32 {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey(r"Software\SoundMirror")
+        .ok()
+        .and_then(|key| key.get_value::<u32, _>("OutputVolumePercent").ok())
+        .unwrap_or(100)
+        .min(200)
+}
+
+fn save_output_volume_percent(percent: u32) {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok((key, _)) = hkcu.create_subkey(r"Software\SoundMirror") {
+        let _ = key.set_value("OutputVolumePercent", &percent.min(200));
+    }
+}
+
 fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "SoundMirror-PC".to_string())
 }
@@ -308,6 +328,16 @@ fn add_client(addr: SocketAddrV4, codec: u8, opus_bitrate_bps: i32) {
     }
 }
 
+fn remove_client(ip: std::net::IpAddr) {
+    let mut clients = CLIENTS.lock().unwrap();
+    let old_len = clients.len();
+    clients.retain(|client| std::net::IpAddr::V4(*client.addr.ip()) != ip);
+    if clients.len() != old_len {
+        CLIENTS_GENERATION.fetch_add(1, Ordering::Release);
+        println!("Client [{}] disconnected", ip);
+    }
+}
+
 fn refresh_clients_snapshot(snapshot: &mut Vec<ClientEndpoint>) -> u32 {
     let now = Instant::now();
     let mut clients = CLIENTS.lock().unwrap();
@@ -354,22 +384,61 @@ fn clamp_i16(value: f32) -> i16 {
     }
 }
 
-fn calculate_amplitude(pcm: &[u8]) -> f32 {
-    if pcm.is_empty() {
-        return 0.0;
+fn apply_output_volume(pcm: &mut [u8], percent: u32) {
+    let percent = percent.min(200);
+    if percent == 100 {
+        return;
     }
-    let mut sum = 0.0;
-    let mut count = 0;
-    for chunk in pcm.chunks_exact(2) {
-        let val = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
-        sum += val * val;
-        count += 1;
+    if percent == 0 {
+        pcm.fill(0);
+        return;
     }
-    if count == 0 {
-        return 0.0;
+
+    let gain = percent as f32 / 100.0;
+    for chunk in pcm.chunks_exact_mut(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        let scaled = clamp_i16(sample as f32 * gain).to_le_bytes();
+        chunk.copy_from_slice(&scaled);
     }
-    let rms = (sum / count as f64).sqrt();
-    (rms / 32768.0) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_output_volume;
+
+    fn pcm(samples: &[i16]) -> Vec<u8> {
+        samples.iter().flat_map(|sample| sample.to_le_bytes()).collect()
+    }
+
+    fn samples(pcm: &[u8]) -> Vec<i16> {
+        pcm.chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect()
+    }
+
+    #[test]
+    fn output_volume_scales_and_clips_pcm16() {
+        let mut half = pcm(&[20_000, -20_000]);
+        apply_output_volume(&mut half, 50);
+        assert_eq!(samples(&half), vec![10_000, -10_000]);
+
+        let mut boosted = pcm(&[20_000, -20_000]);
+        apply_output_volume(&mut boosted, 200);
+        assert_eq!(samples(&boosted), vec![i16::MAX, i16::MIN]);
+    }
+
+    #[test]
+    fn output_volume_handles_mute_and_unity() {
+        let original = pcm(&[12_345, -23_456]);
+
+        let mut unity = original.clone();
+        apply_output_volume(&mut unity, 100);
+        assert_eq!(unity, original);
+
+        let mut muted = original;
+        apply_output_volume(&mut muted, 0);
+        assert_eq!(samples(&muted), vec![0, 0]);
+    }
 }
 
 fn convert_to_stereo_i16(data: &[u8], frames: u32, fmt: &WAVEFORMATEX, out: &mut Vec<u8>) {
@@ -866,6 +935,8 @@ fn control_loop() {
                 if let Ok(text) = std::str::from_utf8(&buffer[..n]) {
                     if text == "SM_SHOW_GUI" && from.ip().is_loopback() {
                         request_gui_show();
+                    } else if text == "SM_DISCONNECT" {
+                        remove_client(from.ip());
                     } else if text.starts_with("SM_CONNECT") {
                         let ip = from.ip();
                         let client_addr = SocketAddrV4::new(
@@ -985,9 +1056,6 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_clients = Vec::with_capacity(4);
     let mut clients_generation = refresh_clients_snapshot(&mut active_clients);
     let mut last_clients_refresh = Instant::now();
-    let mut last_amplitude_update = Instant::now()
-        .checked_sub(Duration::from_millis(40))
-        .unwrap_or_else(Instant::now);
     // Counts consecutive capture-client errors. If the default endpoint's format
     // changes or the device is invalidated (e.g. an app starts audio at a different
     // rate, spatial sound toggles, a USB/BT device connects), the loopback client
@@ -1057,10 +1125,7 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                         client_seqs.retain(|addr, _| active_clients.iter().any(|c| &c.addr == addr));
                     }
 
-                    let measure_amplitude = GUI_VISIBLE.load(Ordering::Relaxed)
-                        && last_amplitude_update.elapsed() >= Duration::from_millis(40);
-                    let needs_pcm = !active_clients.is_empty() || measure_amplitude;
-                    if needs_pcm {
+                    if !active_clients.is_empty() {
                         if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
                             pcm_data.clear();
                             pcm_data.resize(frames as usize * 4, 0);
@@ -1070,10 +1135,9 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                             convert_to_stereo_i16(raw_slice, frames, mix_format, &mut pcm_data);
                         }
 
-                        if measure_amplitude {
-                            set_current_amplitude(calculate_amplitude(&pcm_data));
-                            last_amplitude_update = Instant::now();
-                        }
+                        // Apply one shared gain stage before codec-specific work so
+                        // PCM, Opus, FLAC and the lite codecs all sound equally loud.
+                        apply_output_volume(&mut pcm_data, get_output_volume_percent());
                     }
 
                     let _ = capture_client.ReleaseBuffer(frames);
@@ -1350,6 +1414,7 @@ fn native_window_is_minimized() -> bool {
 // GUI Application Structure using eframe/egui
 struct SoundMirrorApp {
     autostart: bool,
+    output_volume_percent: u32,
     show_window: bool,
     startup_hidden: bool,
 }
@@ -1392,6 +1457,7 @@ impl SoundMirrorApp {
 
         Self {
             autostart: is_autostart_enabled(),
+            output_volume_percent: get_output_volume_percent(),
             show_window: false,
             startup_hidden: false,
         }
@@ -1441,6 +1507,9 @@ impl eframe::App for SoundMirrorApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui: &mut egui::Ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui: &mut egui::Ui| {
             ui.vertical_centered(|ui: &mut egui::Ui| {
                 ui.add_space(8.0);
                 ui.heading(egui::RichText::new("SoundMirror").strong().color(egui::Color32::from_rgb(17, 24, 39)).size(24.0));
@@ -1448,82 +1517,22 @@ impl eframe::App for SoundMirrorApp {
                 ui.add_space(10.0);
             });
 
-            let amp = get_current_amplitude();
             let clients = clients_snapshot();
             let connected = !clients.is_empty();
 
-            // 1. Orbital Visualizer Card (White box, matching Android app)
+            // 1. Compact connection status (the decorative visualizer stays removed).
             egui::Frame::none()
                 .fill(egui::Color32::WHITE)
                 .rounding(8.0)
                 .inner_margin(12.0)
                 .show(ui, |ui: &mut egui::Ui| {
-                    ui.vertical(|ui: &mut egui::Ui| {
-                        ui.horizontal(|ui: &mut egui::Ui| {
-                            let text = if connected { "● 연결됨" } else { "○ 대기 중" };
-                            let color = if connected { egui::Color32::from_rgb(24, 160, 88) } else { egui::Color32::from_rgb(107, 114, 128) };
-                            ui.label(egui::RichText::new(text).color(color).strong());
-                        });
-                        ui.add_space(8.0);
-
-                        // Custom painting for Android-like Orbital Visualizer
-                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 140.0), egui::Sense::hover());
-                        let painter = ui.painter_at(rect);
-                        let center = rect.center();
-
-                        // Pulse calculation
-                        let time = ctx.input(|i| i.time) as f32;
-                        let pulse = (time * std::f32::consts::PI / 0.9).sin() * 0.5 + 0.5;
-                        let ring_amp = if connected { amp } else { 0.08 + pulse * 0.04 };
-
-                        let base_radius = 45.0;
-
-                        // outer blue circle
-                        let outer_color = egui::Color32::from_rgba_unmultiplied(0, 122, 255, if connected { 26 } else { 15 });
-                        painter.circle_filled(center, base_radius + ring_amp * 28.0, outer_color);
-
-                        // middle blue outline
-                        let middle_color = egui::Color32::from_rgba_unmultiplied(0, 122, 255, if connected { 51 } else { 31 });
-                        painter.circle_stroke(center, base_radius * 0.82 + ring_amp * 16.0, egui::Stroke::new(2.0, middle_color));
-
-                        // inner white circle
-                        painter.circle_filled(center, base_radius * 0.65, egui::Color32::WHITE);
-
-                        if connected {
-                            // Render 13 equalizer bars
-                            let bars = 13;
-                            let bar_area_width = 72.0;
-                            let width = bar_area_width / (bars as f32 * 1.6);
-                            let gap = width * 0.6;
-                            
-                            for i in 0..bars {
-                                let phase = (i as f32 - 6.0).abs() / 6.0;
-                                let h = (12.0 + amp * 40.0 * (1.0 - phase * 0.55)).max(6.0);
-                                let x = center.x - (bar_area_width / 2.0) + i as f32 * (width + gap);
-                                let y_top = center.y - h / 2.0;
-                                let y_bottom = center.y + h / 2.0;
-                                
-                                let bar_rect = egui::Rect::from_x_y_ranges(x..=(x + width), y_top..=y_bottom);
-                                painter.rect_filled(bar_rect, egui::Rounding::same(width / 2.0), egui::Color32::from_rgb(0, 122, 255));
-                            }
-                        } else {
-                            // Render standby text
-                            painter.text(
-                                center - egui::vec2(0.0, 5.0),
-                                egui::Align2::CENTER_CENTER,
-                                "대기 중",
-                                egui::FontId::proportional(14.0),
-                                egui::Color32::from_rgb(17, 24, 39)
-                            );
-                            painter.text(
-                                center + egui::vec2(0.0, 12.0),
-                                egui::Align2::CENTER_CENTER,
-                                "서버 검색",
-                                egui::FontId::proportional(10.5),
-                                egui::Color32::from_rgb(156, 163, 175)
-                            );
-                        }
-                    });
+                    let text = if connected { "● 연결됨" } else { "○ 대기 중" };
+                    let color = if connected {
+                        egui::Color32::from_rgb(24, 160, 88)
+                    } else {
+                        egui::Color32::from_rgb(107, 114, 128)
+                    };
+                    ui.label(egui::RichText::new(text).color(color).strong());
                 });
             ui.add_space(10.0);
 
@@ -1591,13 +1600,27 @@ impl eframe::App for SoundMirrorApp {
                 });
             ui.add_space(10.0);
 
-            // 4. Autostart Settings Card
+            // 4. Output and startup settings card
             egui::Frame::none()
                 .fill(egui::Color32::WHITE)
                 .rounding(8.0)
                 .inner_margin(12.0)
                 .show(ui, |ui: &mut egui::Ui| {
                     ui.vertical(|ui: &mut egui::Ui| {
+                        ui.label(egui::RichText::new("송신 볼륨").strong().color(egui::Color32::from_rgb(55, 65, 81)));
+                        ui.horizontal(|ui: &mut egui::Ui| {
+                            let response = ui.add(
+                                egui::Slider::new(&mut self.output_volume_percent, 0..=200)
+                                    .suffix("%")
+                                    .show_value(true),
+                            );
+                            if response.changed() {
+                                set_output_volume_percent(self.output_volume_percent);
+                                save_output_volume_percent(self.output_volume_percent);
+                            }
+                        });
+                        ui.label(egui::RichText::new("휴대폰으로 보내는 소리에만 적용됩니다. 100% 초과는 큰 소리에서 왜곡될 수 있습니다.").color(egui::Color32::from_rgb(122, 132, 148)).size(10.5));
+                        ui.add_space(8.0);
                         let prev = self.autostart;
                         ui.checkbox(&mut self.autostart, "윈도우 시작 시 자동 실행");
                         if self.autostart != prev {
@@ -1607,10 +1630,13 @@ impl eframe::App for SoundMirrorApp {
                         ui.label(egui::RichText::new("💡 창을 닫으면 완전히 꺼지지 않고 트레이로 숨겨집니다.").color(egui::Color32::from_rgb(122, 132, 148)).size(10.5));
                     });
                 });
+            ui.add_space(4.0);
+                });
         });
 
-        // Request continuous repaint for smooth visualizer animations
-        ctx.request_repaint_after(Duration::from_millis(30));
+        // No animated visualizer remains, so a modest status refresh avoids wasting
+        // CPU while keeping device/client changes responsive in the visible window.
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
@@ -1662,6 +1688,7 @@ fn main() {
 
     // Cache the primary IP up front so the GUI and beacon have it immediately.
     set_local_ip(primary_ipv4());
+    set_output_volume_percent(load_output_volume_percent());
 
     // Long-lived discovery + control + device-watch threads. These persist for the
     // whole app lifetime so the capture loop below can restart freely.

@@ -471,6 +471,10 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 // Never crash the app on a connect/bind failure — just reset state.
                 Log.w("SoundMirror", "connect failed", e)
             } finally {
+                // Tell the sender to remove this client immediately. A replacement
+                // connection waits for this job to finish, so DISCONNECT cannot race
+                // behind its new CONNECT announcement.
+                runCatching { announceDisconnect(device) }
                 runCatching { track?.stop() }
                 runCatching { track?.release() }
                 runCatching { socket?.close() }
@@ -488,7 +492,8 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
     fun disconnect() {
         sessionGeneration.incrementAndGet()
         job?.cancel()
-        job = null
+        // Retain the cancelled Job reference until the next connect so it can join
+        // the finalizer (which sends SM_DISCONNECT) before announcing a new session.
         _audioLevel.value = 0f
         _stats.value = StreamStats()
     }
@@ -575,6 +580,21 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     Thread.sleep(80)
                 }
             }
+        }
+    }
+
+    private fun announceDisconnect(device: DiscoveredDevice) {
+        DatagramSocket().use { socket ->
+            val payload = "SM_DISCONNECT".toByteArray(Charsets.UTF_8)
+            val packet = DatagramPacket(
+                payload,
+                payload.size,
+                InetAddress.getByName(device.ip),
+                device.controlPort,
+            )
+            // UDP has no delivery acknowledgement. Two back-to-back copies make a
+            // user-requested disconnect reliable without delaying reconnection.
+            repeat(2) { socket.send(packet) }
         }
     }
 
