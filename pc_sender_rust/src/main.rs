@@ -384,22 +384,95 @@ fn clamp_i16(value: f32) -> i16 {
     }
 }
 
-fn apply_output_volume(pcm: &mut [u8], percent: u32) {
-    let percent = percent.min(200);
-    if percent == 100 {
-        return;
-    }
-    if percent == 0 {
-        pcm.fill(0);
-        return;
+#[derive(Clone, Copy)]
+pub struct VolumeLimiter {
+    envelope: f32,
+}
+
+impl VolumeLimiter {
+    pub const fn new() -> Self {
+        Self { envelope: 1.0 }
     }
 
-    let gain = percent as f32 / 100.0;
-    for chunk in pcm.chunks_exact_mut(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        let scaled = clamp_i16(sample as f32 * gain).to_le_bytes();
-        chunk.copy_from_slice(&scaled);
+    pub fn apply(&mut self, pcm: &mut [u8], percent: u32) {
+        let percent = percent.min(200);
+        if percent == 100 {
+            self.envelope = 1.0;
+            return;
+        }
+        if percent == 0 {
+            self.envelope = 1.0;
+            pcm.fill(0);
+            return;
+        }
+
+        let gain = percent as f32 / 100.0;
+
+        if percent <= 100 {
+            self.envelope = 1.0;
+            for chunk in pcm.chunks_exact_mut(2) {
+                let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32;
+                let scaled = (sample * gain).round() as i16;
+                chunk.copy_from_slice(&scaled.to_le_bytes());
+            }
+            return;
+        }
+
+        // Boost mode (> 100%): apply dynamic peak limiting with soft-knee saturation
+        // to prevent digital clipping / distortion when boosting volume.
+        const CEILING: f32 = 32000.0;
+        const RELEASE_COEFF: f32 = 0.0005; // ~40-50ms smooth recovery at 44.1/48kHz
+
+        let mut chunks = pcm.chunks_exact_mut(4);
+        for frame in chunks.by_ref() {
+            let left = i16::from_le_bytes([frame[0], frame[1]]) as f32;
+            let right = i16::from_le_bytes([frame[2], frame[3]]) as f32;
+
+            let peak = left.abs().max(right.abs()) * gain;
+
+            if peak * self.envelope > CEILING {
+                // Instant attack: clamp gain immediately so peak never clips
+                self.envelope = CEILING / peak;
+            } else {
+                // Smooth exponential release toward unity
+                self.envelope = (self.envelope + (1.0 - self.envelope) * RELEASE_COEFF).min(1.0);
+            }
+
+            let effective_gain = gain * self.envelope;
+            let out_left = soft_knee_clip(left * effective_gain);
+            let out_right = soft_knee_clip(right * effective_gain);
+
+            frame[0..2].copy_from_slice(&out_left.to_le_bytes());
+            frame[2..4].copy_from_slice(&out_right.to_le_bytes());
+        }
+
+        let rem = chunks.into_remainder();
+        if rem.len() >= 2 {
+            let s = i16::from_le_bytes([rem[0], rem[1]]) as f32;
+            let out = soft_knee_clip(s * gain * self.envelope);
+            rem[0..2].copy_from_slice(&out.to_le_bytes());
+        }
     }
+}
+
+#[inline]
+fn soft_knee_clip(sample: f32) -> i16 {
+    const THRESHOLD: f32 = 29000.0;
+    const MARGIN: f32 = 32767.0 - THRESHOLD; // 3767.0
+    let abs_val = sample.abs();
+    if abs_val <= THRESHOLD {
+        clamp_i16(sample)
+    } else {
+        let excess = abs_val - THRESHOLD;
+        let compressed = THRESHOLD + MARGIN * (excess / (MARGIN + excess));
+        let final_val = if sample < 0.0 { -compressed } else { compressed };
+        clamp_i16(final_val)
+    }
+}
+
+#[cfg(test)]
+fn apply_output_volume(pcm: &mut [u8], percent: u32) {
+    VolumeLimiter::new().apply(pcm, percent);
 }
 
 #[cfg(test)]
@@ -417,14 +490,18 @@ mod tests {
     }
 
     #[test]
-    fn output_volume_scales_and_clips_pcm16() {
+    fn output_volume_scales_without_harsh_clipping() {
         let mut half = pcm(&[20_000, -20_000]);
         apply_output_volume(&mut half, 50);
         assert_eq!(samples(&half), vec![10_000, -10_000]);
 
         let mut boosted = pcm(&[20_000, -20_000]);
         apply_output_volume(&mut boosted, 200);
-        assert_eq!(samples(&boosted), vec![i16::MAX, i16::MIN]);
+        let s = samples(&boosted);
+        // Under 200% boost, the limiter and soft-knee smoothly compress without reaching hard clip ceiling (32767)
+        assert!(s[0] > 20_000 && s[0] < 32767);
+        assert!(s[1] < -20_000 && s[1] > -32768);
+        assert_eq!(s[0], -s[1]);
     }
 
     #[test]
@@ -1053,6 +1130,7 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
     let mut lite_payload = Vec::new();
     let mut packet_scratch = Vec::with_capacity(4096);
     let mut flac_fallback_pcm = Vec::new();
+    let mut volume_limiter = VolumeLimiter::new();
     let mut active_clients = Vec::with_capacity(4);
     let mut clients_generation = refresh_clients_snapshot(&mut active_clients);
     let mut last_clients_refresh = Instant::now();
@@ -1137,7 +1215,7 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Apply one shared gain stage before codec-specific work so
                         // PCM, Opus, FLAC and the lite codecs all sound equally loud.
-                        apply_output_volume(&mut pcm_data, get_output_volume_percent());
+                        volume_limiter.apply(&mut pcm_data, get_output_volume_percent());
                     }
 
                     let _ = capture_client.ReleaseBuffer(frames);

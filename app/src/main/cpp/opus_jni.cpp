@@ -22,7 +22,7 @@ Java_com_soundmirror_app_NativeOpus_nativeDecode(
     if (dec == nullptr) {
         return -1;
     }
-    jshort *out = env->GetShortArrayElements(pcm_out, nullptr);
+    jshort *out = reinterpret_cast<jshort *>(env->GetPrimitiveArrayCritical(pcm_out, nullptr));
     if (out == nullptr) {
         return -1;
     }
@@ -32,13 +32,17 @@ Java_com_soundmirror_app_NativeOpus_nativeDecode(
         // Packet loss concealment: null input asks Opus to synthesise a frame.
         decoded = opus_decode(dec, nullptr, 0, out, frame_size, fec ? 1 : 0);
     } else {
-        jbyte *in = env->GetByteArrayElements(data, nullptr);
+        jbyte *in = reinterpret_cast<jbyte *>(env->GetPrimitiveArrayCritical(data, nullptr));
+        if (in == nullptr) {
+            env->ReleasePrimitiveArrayCritical(pcm_out, out, JNI_ABORT);
+            return -1;
+        }
         decoded = opus_decode(dec, reinterpret_cast<const unsigned char *>(in), len,
                               out, frame_size, fec ? 1 : 0);
-        env->ReleaseByteArrayElements(data, in, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(data, in, JNI_ABORT);
     }
 
-    env->ReleaseShortArrayElements(pcm_out, out, 0);
+    env->ReleasePrimitiveArrayCritical(pcm_out, out, 0);
     return decoded;
 }
 

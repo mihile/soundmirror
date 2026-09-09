@@ -86,11 +86,11 @@ Java_com_soundmirror_app_NativeFlac_nativeDecode(
         jshortArray pcm_out, jint max_shorts) {
     FlacState *s = reinterpret_cast<FlacState *>(handle);
     if (s == nullptr) return -1;
-    jbyte *in = env->GetByteArrayElements(data, nullptr);
-    jshort *out = env->GetShortArrayElements(pcm_out, nullptr);
+    jbyte *in = reinterpret_cast<jbyte *>(env->GetPrimitiveArrayCritical(data, nullptr));
+    jshort *out = reinterpret_cast<jshort *>(env->GetPrimitiveArrayCritical(pcm_out, nullptr));
     if (in == nullptr || out == nullptr) {
-        if (in) env->ReleaseByteArrayElements(data, in, JNI_ABORT);
-        if (out) env->ReleaseShortArrayElements(pcm_out, out, JNI_ABORT);
+        if (in) env->ReleasePrimitiveArrayCritical(data, in, JNI_ABORT);
+        if (out) env->ReleasePrimitiveArrayCritical(pcm_out, out, JNI_ABORT);
         return -1;
     }
     s->in = reinterpret_cast<const uint8_t *>(in);
@@ -105,8 +105,8 @@ Java_com_soundmirror_app_NativeFlac_nativeDecode(
     FLAC__stream_decoder_process_until_end_of_stream(s->dec);
 
     int result = s->error ? -1 : s->out_len;
-    env->ReleaseByteArrayElements(data, in, JNI_ABORT);
-    env->ReleaseShortArrayElements(pcm_out, out, 0); // commit decoded PCM
+    env->ReleasePrimitiveArrayCritical(data, in, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(pcm_out, out, 0); // commit decoded PCM
     return result;
 }
 
