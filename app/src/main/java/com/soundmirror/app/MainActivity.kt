@@ -1004,7 +1004,8 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 }
                 val written = writeFully(track, decoded, samples)
                 if (resumeTrackAfterWrite && written > 0) {
-                    try { track.play() } catch (_: Exception) {}
+                    // writeFully starts playback as soon as priming makes progress,
+                    // including when the first packet only fits partially.
                     resumeTrackAfterWrite = false
                     lastUnderrunCount = runCatching { track.underrunCount }.getOrDefault(0)
                 }
@@ -1439,6 +1440,14 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 throw IllegalStateException("AudioTrack.write failed: $result")
             }
             if (result == 0) {
+                // A paused track can retain a full hardware buffer after rebuffering.
+                // Let it drain before retrying; waiting for a complete packet before
+                // play() would leave every subsequent write returning zero.
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    track.play()
+                    zeroWrites = 0
+                    continue
+                }
                 // A blocking write should not return zero, but bound the retry so a
                 // broken track cannot busy-spin forever on the urgent-audio thread.
                 zeroWrites += 1
@@ -1458,6 +1467,11 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             }
             offset += result
             zeroWrites = 0
+            // Prime with the data that actually fitted, then start the consumer.
+            // This also covers PLC writes made before the first normal packet.
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                track.play()
+            }
         }
         return offset
     }

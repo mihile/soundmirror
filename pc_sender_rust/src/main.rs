@@ -613,15 +613,15 @@ fn linear_to_mulaw(sample: i16) -> u8 {
     !((sign as u8) | ((exponent as u8) << 4) | (mantissa as u8))
 }
 
-fn encode_mulaw(pcm: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(pcm.len() / 2);
+fn encode_mulaw(pcm: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(pcm.len() / 2);
     for i in (0..pcm.len()).step_by(2) {
         if i + 1 < pcm.len() {
             let sample = i16::from_le_bytes([pcm[i], pcm[i + 1]]);
             out.push(linear_to_mulaw(sample));
         }
     }
-    out
 }
 
 fn encode_ima_sample(sample: i16, predictor: &mut i32, index: &mut i32) -> u8 {
@@ -774,10 +774,11 @@ static FLAC_CONFIG: LazyLock<flacenc::error::Verified<flacenc::config::Encoder>>
 });
 
 // Encode one interleaved stereo i16 block as a standalone FLAC stream.
-fn encode_flac(frame_i16: &[i16], frames_per_channel: usize, sample_rate: u32) -> Option<Vec<u8>> {
+fn encode_flac(frame_i16: &[i16], frames_per_channel: usize, sample_rate: u32, s32: &mut Vec<i32>) -> Option<Vec<u8>> {
     use flacenc::component::BitRepr;
-    let s32: Vec<i32> = frame_i16.iter().map(|&x| x as i32).collect();
-    let source = flacenc::source::MemSource::from_samples(&s32, 2, 16, sample_rate as usize);
+    s32.clear();
+    s32.extend(frame_i16.iter().map(|&x| x as i32));
+    let source = flacenc::source::MemSource::from_samples(s32.as_slice(), 2, 16, sample_rate as usize);
     let stream = flacenc::encode_with_fixed_block_size(&FLAC_CONFIG, source, frames_per_channel).ok()?;
     let mut sink = flacenc::bitsink::ByteSink::new();
     stream.write(&mut sink).ok()?;
@@ -803,10 +804,11 @@ fn downsample_half(pcm: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-fn encode_adpcm(pcm: &[u8], frames: u32, state: &mut AdpcmState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(frames as usize + 8);
+fn encode_adpcm(pcm: &[u8], frames: u32, state: &mut AdpcmState, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(frames as usize + 8);
     if frames == 0 || pcm.len() < 4 {
-        return out;
+        return;
     }
     let mut left = pcm_at(pcm, 0, 0) as i32;
     let mut right = pcm_at(pcm, 0, 1) as i32;
@@ -821,7 +823,6 @@ fn encode_adpcm(pcm: &[u8], frames: u32, state: &mut AdpcmState) -> Vec<u8> {
         let r = encode_ima_sample(pcm_at(pcm, frame, 1), &mut right, &mut state.right_index);
         out.push(l | (r << 4));
     }
-    out
 }
 
 fn build_packet(seq: u32, sample_rate: u32, frames: u16, codec: u8, payload: &[u8], packet: &mut Vec<u8>) {
@@ -1129,6 +1130,10 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
     let mut pcm_i16 = Vec::new();
     let mut lite_payload = Vec::new();
     let mut packet_scratch = Vec::with_capacity(4096);
+    // Encoding and send_to finish before the next client uses these buffers.
+    // Keep storage across packets without sharing codec state between clients.
+    let mut encoded_scratch = Vec::with_capacity(4096);
+    let mut flac_samples = Vec::with_capacity((sample_rate / 100) as usize * 2);
     let mut flac_fallback_pcm = Vec::new();
     let mut volume_limiter = VolumeLimiter::new();
     let mut active_clients = Vec::with_capacity(4);
@@ -1245,14 +1250,14 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                                 let state = adpcm_states
                                     .entry(client.addr)
                                     .or_insert(AdpcmState { left_index: 0, right_index: 0 });
-                                let encoded = encode_adpcm(processed_payload, target_frames, state);
-                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded, &mut packet_scratch);
+                                encode_adpcm(processed_payload, target_frames, state, &mut encoded_scratch);
+                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded_scratch, &mut packet_scratch);
                                 let _ = out_socket.send_to(&packet_scratch, client.addr);
                                 *client_seq = client_seq.wrapping_add(1);
                             }
                             2 | 3 => {
-                                let encoded = encode_mulaw(processed_payload);
-                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded, &mut packet_scratch);
+                                encode_mulaw(processed_payload, &mut encoded_scratch);
+                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded_scratch, &mut packet_scratch);
                                 let _ = out_socket.send_to(&packet_scratch, client.addr);
                                 *client_seq = client_seq.wrapping_add(1);
                             }
@@ -1333,7 +1338,7 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                             while state.accum.len() >= state.frame_total_samples {
                                 state.frame.clear();
                                 state.frame.extend(state.accum.drain(0..state.frame_total_samples));
-                                match encode_flac(&state.frame, state.frame_per_channel as usize, sample_rate) {
+                                match encode_flac(&state.frame, state.frame_per_channel as usize, sample_rate, &mut flac_samples) {
                                     Some(encoded) => {
                                         build_packet(
                                             *client_seq,
