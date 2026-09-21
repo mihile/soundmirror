@@ -104,7 +104,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import java.util.PriorityQueue
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
@@ -397,7 +397,9 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
 
     // Reusable packet pool: avoids per-packet ByteArray and object allocation at 100-200 Hz,
     // drastically reducing ART GC churn and battery usage while preserving zero latency.
-    private val packetPool = ConcurrentLinkedQueue<AudioPacket>()
+    // Fixed storage avoids linked-node allocation and an O(n) size scan for
+    // every returned packet. offer/poll never wait for space or an element.
+    private val packetPool = ArrayBlockingQueue<AudioPacket>(256)
 
     private fun obtainAudioPacket(
         seq: Long,
@@ -428,7 +430,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
     }
 
     private fun recyclePacket(packet: AudioPacket?) {
-        if (packet != null && packetPool.size < 256) {
+        if (packet != null) {
             packetPool.offer(packet)
         }
     }
@@ -499,7 +501,6 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     soTimeout = AUDIO_SOCKET_TIMEOUT_MS
                     receiveBufferSize = 1024 * 1024
                 }
-                announceConnect(device)
                 track = createAudioTrack(device.sampleRate, device.channels, settings).apply {
                     setVolume(settings.volume)
                 }
@@ -651,7 +652,9 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
     }
 
     private suspend fun receiveAudio(socket: DatagramSocket, track: AudioTrack, device: DiscoveredDevice) {
-        lastPongMs = System.currentTimeMillis()
+        val senderAddress = InetAddress.getByName(device.ip)
+        lastPongMs = android.os.SystemClock.elapsedRealtime()
+        rttMs = 0L
         val queue = PriorityQueue<AudioPacket>(compareBy { it.seq })
         var expectedSeq: Long? = null
         var received = 0L
@@ -677,6 +680,11 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         // low-latency buffer grow even on an otherwise healthy connection.
         var resumeTrackAfterWrite = false
         var activeTrackBufferFrames = runCatching { track.bufferSizeInFrames }.getOrDefault(0)
+        var bufferFloorFrames = activeTrackBufferFrames
+        var lastBufferChangeMs = android.os.SystemClock.elapsedRealtime()
+        var lastUnstableMs = lastBufferChangeMs
+        var shrinkPreviousFrames = 0
+        var excessDelaySinceMs = 0L
         // AudioTrack is created already at settings.volume; only re-apply when the
         // user actually changes the volume, instead of on every played packet.
         var lastVolume = settings.volume
@@ -687,28 +695,36 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             // channel could overflow before the actual jitter buffer saw the data.
             capacity = 512,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
+            onUndeliveredElement = { recyclePacket(it) },
         )
 
         val pingJob = scope.launch(Dispatchers.IO) {
             try {
                 DatagramSocket().use { socket ->
+                    // Control replies must come from this session's PC and port.
+                    socket.connect(senderAddress, device.controlPort)
                     socket.soTimeout = 1000
                     val buf = ByteArray(128)
                     val packet = DatagramPacket(buf, buf.size)
                     while (currentCoroutineContext().isActive) {
                         try {
-                            val sentTime = System.currentTimeMillis()
+                            val sentTime = android.os.SystemClock.elapsedRealtime()
                             val msg = "SM_PING $sentTime".toByteArray(Charsets.UTF_8)
-                            val sendPacket = DatagramPacket(msg, msg.size, InetAddress.getByName(device.ip), device.controlPort)
+                            val sendPacket = DatagramPacket(msg, msg.size, senderAddress, device.controlPort)
                             socket.send(sendPacket)
-                            
-                            socket.receive(packet)
-                            val resp = String(packet.data, 0, packet.length, Charsets.UTF_8)
-                            if (resp.startsWith("SM_PONG ")) {
-                                lastPongMs = System.currentTimeMillis()
-                                val time = resp.substring(8).trim().toLongOrNull()
-                                if (time != null) {
-                                    rttMs = System.currentTimeMillis() - time
+                            val deadline = sentTime + 1000L
+                            while (currentCoroutineContext().isActive) {
+                                val remaining = deadline - android.os.SystemClock.elapsedRealtime()
+                                if (remaining <= 0) break
+                                socket.soTimeout = remaining.toInt().coerceAtLeast(1)
+                                packet.setData(buf, 0, buf.size)
+                                socket.receive(packet)
+                                val resp = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                                if (resp == "SM_PONG $sentTime") {
+                                    val receivedAt = android.os.SystemClock.elapsedRealtime()
+                                    lastPongMs = receivedAt
+                                    rttMs = receivedAt - sentTime
+                                    break
                                 }
                             }
                         } catch (_: Exception) {}
@@ -738,19 +754,29 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 try {
                     packet.setData(recvBuffer, 0, recvBuffer.size)
                     socket.receive(packet)
+                    // Sender audio ports are ephemeral, so filter by the selected
+                    // PC's address rather than connecting this UDP socket to a port.
+                    if (packet.address != senderAddress) continue
+                    val parsed = parseAudioPacket(packet.data, packet.length) ?: continue
                     if (timeoutCount > 0) {
                         timeoutCount = 0
                         reconnectNotified = false
                     }
-                    val parsed = parseAudioPacket(packet.data, packet.length) ?: continue
                     receivedPayloadBytes.addAndGet(parsed.payloadSize.toLong())
-                    packetChannel.trySend(parsed)
+                    // Failed trySend retains ownership; the channel only recycles
+                    // packets it accepted (including overflow and cancellation).
+                    if (packetChannel.trySend(parsed).isFailure) {
+                        recyclePacket(parsed)
+                    }
                 } catch (_: SocketTimeoutException) {
                     // No audio for a while. If the control channel (ping/pong) still
                     // works, the PC is simply silent (paused / gap between tracks) —
                     // that's not a problem, so stay quiet and just keep the PC's client
                     // entry alive. Only treat it as instability if pings also stopped.
-                    val controlAlive = System.currentTimeMillis() - lastPongMs < 5000
+                    // Background pings are 4 s apart, plus up to 1 s response wait.
+                    // Keep enough grace for two missed checks even if the UI just
+                    // became visible; wall-clock adjustments must not expire it.
+                    val controlAlive = android.os.SystemClock.elapsedRealtime() - lastPongMs < 15000
                     if (controlAlive) {
                         timeoutCount = 0
                         reconnectNotified = false
@@ -786,6 +812,13 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         val keepAliveJob = scope.launch(Dispatchers.IO) {
             try {
                 DatagramSocket().use { keepAliveSocket ->
+                    // The receiver and AudioTrack are ready before requesting audio.
+                    // Retry on this IO job, never sleep on the playout thread.
+                    repeat(3) {
+                        if (!currentCoroutineContext().isActive) return@launch
+                        announceConnect(device, 1, keepAliveSocket)
+                        delay(80)
+                    }
                     while (currentCoroutineContext().isActive) {
                         try {
                             val keepAliveDelay = if (_stats.subscriptionCount.value > 0) 3000L else 6000L
@@ -851,6 +884,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 // When the toggle flips into deep mode, rebuffer up to the deep target.
                 // This is one brief gap right when you enable it, then it stays smooth.
                 if (prevDeepMode != deepMode) {
+                    lastUnstableMs = android.os.SystemClock.elapsedRealtime()
                     // The latency target changes by roughly two seconds here. Do not
                     // blend the previous mode's value into the new measurement.
                     smoothedLatencyMs = 0.0
@@ -902,6 +936,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     if (p != null) {
                         queue.add(p)
                     } else if (currentCoroutineContext().isActive) {
+                        lastUnstableMs = android.os.SystemClock.elapsedRealtime()
                         isBuffering = true
                         resumeTrackAfterWrite = false
                         try { track.pause() } catch (_: Exception) {}
@@ -1028,6 +1063,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 // checking it even when the user freezes numeric metric sampling.
                 if (now - lastMaintenanceMs >= PLAYBACK_MAINTENANCE_INTERVAL_MS) {
                     lastMaintenanceMs = now
+                    val maintenanceNow = android.os.SystemClock.elapsedRealtime()
                     val underrunCount = runCatching { track.underrunCount }
                         .getOrDefault(lastUnderrunCount.coerceAtLeast(0))
                     val underrunAdvanced = lastUnderrunCount >= 0 &&
@@ -1039,6 +1075,20 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     val audibleUnderrun = underrunAdvanced &&
                         (if (decodedRms >= 0f) decodedRms else pcmAmplitude(decoded, samples)) >=
                             SILENCE_SHED_RMS
+                    if (underrunAdvanced || isBuffering || resumeTrackAfterWrite) {
+                        lastUnstableMs = maintenanceNow
+                    }
+                    if (audibleUnderrun && shrinkPreviousFrames > 0) {
+                        // A reduction that caused starvation is not retried again
+                        // this session. Restore the previously stable size first.
+                        bufferFloorFrames = maxOf(bufferFloorFrames, shrinkPreviousFrames)
+                        val restored = runCatching {
+                            track.setBufferSizeInFrames(bufferFloorFrames)
+                        }.getOrDefault(activeTrackBufferFrames)
+                        if (restored > 0) activeTrackBufferFrames = restored
+                        shrinkPreviousFrames = 0
+                        lastBufferChangeMs = maintenanceNow
+                    }
                     if (audibleUnderrun &&
                         lowLatencyBufferCeilingFrames > 0 &&
                         activeTrackBufferFrames < lowLatencyBufferCeilingFrames
@@ -1057,11 +1107,30 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         }.getOrDefault(activeTrackBufferFrames)
                         if (appliedFrames > 0) {
                             activeTrackBufferFrames = appliedFrames
+                            lastBufferChangeMs = maintenanceNow
                             Log.d(
                                 "SoundMirrorPerf",
                                 "underrun: buffer -> $activeTrackBufferFrames/$lowLatencyBufferCeilingFrames frames",
                             )
                         }
+                    }
+                    if (!deepMode && !isBuffering && !resumeTrackAfterWrite &&
+                        lowLatencyBufferCeilingFrames > 0 &&
+                        activeTrackBufferFrames > bufferFloorFrames &&
+                        maintenanceNow - lastUnstableMs >= 15000 &&
+                        maintenanceNow - lastBufferChangeMs >= 15000
+                    ) {
+                        val previousFrames = activeTrackBufferFrames
+                        val requested = (previousFrames - (device.sampleRate / 100).coerceAtLeast(1))
+                            .coerceAtLeast(bufferFloorFrames)
+                        val applied = runCatching { track.setBufferSizeInFrames(requested) }
+                            .getOrDefault(previousFrames)
+                        if (applied > 0 && applied < previousFrames) {
+                            shrinkPreviousFrames = previousFrames
+                            activeTrackBufferFrames = applied
+                            Log.d("SoundMirrorPerf", "stable: buffer -> $applied frames")
+                        }
+                        lastBufferChangeMs = maintenanceNow
                     }
                     lastUnderrunCount = underrunCount
                     val maintenanceTrackDelayMs = try {
@@ -1071,7 +1140,17 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     } catch (_: Exception) {
                         0.0
                     }
-                    if (!deepMode && maintenanceTrackDelayMs > 100.0 && now - lastTrimMs > 2500) {
+                    // Some Bluetooth devices legitimately require >100 ms of output
+                    // buffering. Only flush persistent delay beyond the active size.
+                    val trimThresholdMs = maxOf(100.0,
+                        activeTrackBufferFrames * 1000.0 / device.sampleRate.coerceAtLeast(1) + 20.0)
+                    if (!deepMode && maintenanceTrackDelayMs > trimThresholdMs) {
+                        if (excessDelaySinceMs == 0L) excessDelaySinceMs = maintenanceNow
+                    } else {
+                        excessDelaySinceMs = 0L
+                    }
+                    if (excessDelaySinceMs != 0L && maintenanceNow - excessDelaySinceMs >= 1000 &&
+                        now - lastTrimMs > 2500) {
                         Log.d("SoundMirrorLat", "trim: track=${maintenanceTrackDelayMs.toInt()}ms -> reset")
                         lastTrimMs = now
                         lost += queue.size.toLong()
@@ -1089,6 +1168,8 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         fadeInNext = false
                         smoothedLatencyMs = 0.0
                         isBuffering = true
+                        excessDelaySinceMs = 0L
+                        lastUnstableMs = maintenanceNow
                     }
                 }
 
@@ -1155,17 +1236,15 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 recyclePacket(playPacket)
             }
         } finally {
-            while (queue.isNotEmpty()) {
-                recyclePacket(queue.poll())
-            }
-            while (true) {
-                val leftover = packetChannel.tryReceive().getOrNull() ?: break
-                recyclePacket(leftover)
-            }
-            packetChannel.close()
+            // Cancel first so a racing receiver cannot refill the channel after
+            // cleanup. Buffered packets return via onUndeliveredElement.
+            packetChannel.cancel()
             receiveJob.cancel()
             keepAliveJob.cancel()
             pingJob.cancel()
+            while (queue.isNotEmpty()) {
+                recyclePacket(queue.poll())
+            }
         }
     }
 
