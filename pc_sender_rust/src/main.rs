@@ -477,7 +477,7 @@ fn apply_output_volume(pcm: &mut [u8], percent: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_output_volume;
+    use super::{apply_output_volume, encode_flac, send_lossless_frame};
 
     fn pcm(samples: &[i16]) -> Vec<u8> {
         samples.iter().flat_map(|sample| sample.to_le_bytes()).collect()
@@ -515,6 +515,51 @@ mod tests {
         let mut muted = original;
         apply_output_volume(&mut muted, 0);
         assert_eq!(samples(&muted), vec![0, 0]);
+    }
+
+    #[test]
+    fn incompressible_flac_is_sent_losslessly_without_ip_fragmentation() {
+        let mut seed = 12345u32;
+        let frame: Vec<i16> = (0..960).map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as i16
+        }).collect();
+        let encoded = encode_flac(&frame, 480, 48000, &mut Vec::new()).unwrap();
+        assert!(encoded.len() + 28 > 1400);
+        for encoded in [Some(encoded.as_slice()), None] {
+            let mut seq = u32::MAX;
+            let mut packets = Vec::new();
+            send_lossless_frame(&mut seq, 48000, &frame, encoded,
+                &mut Vec::new(), &mut Vec::new(), |packet| packets.push(packet.to_vec()));
+            assert_eq!(packets.len(), 2);
+            assert_eq!(seq, 1);
+            let mut restored = Vec::new();
+            for (index, packet) in packets.iter().enumerate() {
+                assert!(packet.len() <= 1400);
+                assert_eq!(packet[4], 0); // PCM is also lossless.
+                assert_eq!(u32::from_be_bytes(packet[5..9].try_into().unwrap()),
+                    u32::MAX.wrapping_add(index as u32));
+                let frames = u16::from_be_bytes(packet[14..16].try_into().unwrap()) as usize;
+                assert_eq!(packet.len() - 28, frames * 4);
+                restored.extend(samples(&packet[28..]));
+            }
+            assert_eq!(restored, frame);
+        }
+    }
+
+    #[test]
+    fn fitting_flac_payload_keeps_its_original_encoding() {
+        let frame = vec![0i16; 960];
+        let encoded = vec![0u8; 1400 - 28];
+        let mut seq = 8;
+        let mut packets = Vec::new();
+        send_lossless_frame(&mut seq, 48000, &frame, Some(&encoded),
+            &mut Vec::new(), &mut Vec::new(), |packet| packets.push(packet.to_vec()));
+        assert_eq!(seq, 9);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0][4], 6);
+        assert_eq!(&packets[0][28..], encoded.as_slice());
+        assert_eq!(packets[0].len(), 1400);
     }
 }
 
@@ -845,6 +890,33 @@ fn build_packet(seq: u32, sample_rate: u32, frames: u16, codec: u8, payload: &[u
     packet.extend_from_slice(payload);
 }
 
+// Keep each UDP payload comfortably below a normal 1500-byte LAN MTU. Dense
+// audio can make a 10 ms FLAC block larger than the MTU. Lossless PCM chunks
+// avoid fragmentation without codec negotiation or dropping any samples.
+fn send_lossless_frame(
+    seq: &mut u32,
+    sample_rate: u32,
+    frame: &[i16],
+    encoded: Option<&[u8]>,
+    packet: &mut Vec<u8>,
+    pcm: &mut Vec<u8>,
+    mut send: impl FnMut(&[u8]),
+) {
+    if let Some(encoded) = encoded.filter(|data| data.len() + 28 <= 1400) {
+        build_packet(*seq, sample_rate, (frame.len() / 2) as u16, 6, encoded, packet);
+        send(packet);
+        *seq = seq.wrapping_add(1);
+    } else {
+        for chunk in frame.chunks(320 * 2) {
+            pcm.clear();
+            pcm.extend(chunk.iter().flat_map(|sample| sample.to_le_bytes()));
+            build_packet(*seq, sample_rate, (chunk.len() / 2) as u16, 0, pcm, packet);
+            send(packet);
+            *seq = seq.wrapping_add(1);
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BeaconPayload {
@@ -1051,7 +1123,7 @@ fn control_loop() {
     }
 }
 
-fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
+fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         // May return S_FALSE if COM is already initialised on this thread (restart case).
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -1121,10 +1193,8 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
     let mut adpcm_states: HashMap<SocketAddrV4, AdpcmState> = HashMap::new();
     let mut opus_states: HashMap<SocketAddrV4, OpusClientState> = HashMap::new();
     let mut flac_states: HashMap<SocketAddrV4, FlacClientState> = HashMap::new();
-    // Per-client sequence numbers. Shared across codecs for a given client so that
-    // switching codec mid-stream keeps seq monotonic (no backwards jump that the
-    // receiver's jitter buffer would mistake for stale packets).
-    let mut client_seqs: HashMap<SocketAddrV4, u32> = HashMap::new();
+    // Sequence numbers belong to the long-lived streaming thread, not this capture
+    // instance. Endpoint recovery must not reset an active receiver's sequence.
     let mut opus_out = [0u8; 4000];
     let mut pcm_data = Vec::new();
     let mut pcm_i16 = Vec::new();
@@ -1338,38 +1408,11 @@ fn run_audio() -> Result<(), Box<dyn std::error::Error>> {
                             while state.accum.len() >= state.frame_total_samples {
                                 state.frame.clear();
                                 state.frame.extend(state.accum.drain(0..state.frame_total_samples));
-                                match encode_flac(&state.frame, state.frame_per_channel as usize, sample_rate, &mut flac_samples) {
-                                    Some(encoded) => {
-                                        build_packet(
-                                            *client_seq,
-                                            sample_rate,
-                                            state.frame_per_channel,
-                                            6,
-                                            &encoded,
-                                            &mut packet_scratch,
-                                        );
-                                        let _ = out_socket.send_to(&packet_scratch, client.addr);
-                                    }
-                                    None => {
-                                        // Encode failed — send the raw block as PCM16 so
-                                        // the listener hears it regardless.
-                                        flac_fallback_pcm.clear();
-                                        flac_fallback_pcm.reserve(state.frame.len() * 2);
-                                        for s in &state.frame {
-                                            flac_fallback_pcm.extend_from_slice(&s.to_le_bytes());
-                                        }
-                                        build_packet(
-                                            *client_seq,
-                                            sample_rate,
-                                            state.frame_per_channel,
-                                            0,
-                                            &flac_fallback_pcm,
-                                            &mut packet_scratch,
-                                        );
-                                        let _ = out_socket.send_to(&packet_scratch, client.addr);
-                                    }
-                                }
-                                *client_seq = client_seq.wrapping_add(1);
+                                let encoded = encode_flac(&state.frame, state.frame_per_channel as usize,
+                                    sample_rate, &mut flac_samples);
+                                send_lossless_frame(client_seq, sample_rate, &state.frame,
+                                    encoded.as_deref(), &mut packet_scratch, &mut flac_fallback_pcm,
+                                    |packet| { let _ = out_socket.send_to(packet, client.addr); });
                             }
                         }
                     }
@@ -1781,8 +1824,9 @@ fn main() {
 
     // Core audio capture loop. Restarts itself when the default output device changes.
     thread::spawn(|| {
+        let mut client_seqs: HashMap<SocketAddrV4, u32> = HashMap::new();
         while RUNNING.load(Ordering::Relaxed) {
-            if let Err(e) = run_audio() {
+            if let Err(e) = run_audio(&mut client_seqs) {
                 eprintln!("Error running audio loop: {:?}", e);
                 thread::sleep(Duration::from_millis(500));
             }

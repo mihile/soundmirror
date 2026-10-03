@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -75,6 +76,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
@@ -103,7 +107,6 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
-import java.util.PriorityQueue
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
@@ -137,9 +140,9 @@ private const val PLAYBACK_MAINTENANCE_INTERVAL_MS = 250L
 // runs this far behind real time — see the in-app description.
 const val DEEP_BUFFER_MS = 2000.0
 
-// RMS level (0..1) under which a packet counts as silence for latency shedding
-// (~ -52 dBFS: gaps between songs and pauses qualify, quiet music does not).
-private const val SILENCE_SHED_RMS = 0.0025f
+// Used only to decide whether an underrun warrants hardware-buffer growth.
+// Quiet audio below this level is still audio and must not be discarded.
+private const val AUDIBLE_UNDERRUN_RMS = 0.0025f
 
 // IMA ADPCM tables. Hoisted to file scope so they are allocated exactly once for
 // the whole process — previously they were rebuilt inside the per-sample decode
@@ -215,6 +218,11 @@ data class StreamStats(
     val codecLabel: String = "",
     val bitrateLabel: String = "",
     val latencyLabel: String = "",
+    val appWaitMs: Int = 0,
+    val outputWaitMs: Int = 0,
+    val networkEstimateMs: Int? = null,
+    val deviceExtraMs: Int? = null,
+    val outputRouteLabel: String = "출력 확인 중",
 )
 
 enum class AudioCodec(
@@ -256,14 +264,6 @@ private val STATS_REFRESH_LABELS = listOf("0.25초", "0.5초", "1초", "2초", "
 private fun AudioCodec.settingsBitrate(opusBitrateKbps: Int): String = when (this) {
     AudioCodec.Opus -> "$opusBitrateKbps kbps"
     else -> bitrate
-}
-
-private fun AudioCodec.estimatedBufferMs(packets: Int): Int {
-    val packetMs = when (this) {
-        AudioCodec.Opus, AudioCodec.Flac -> 10.0
-        AudioCodec.Pcm16 -> 5.0
-    }
-    return (packets * packetMs).roundToInt()
 }
 
 class DiscoveryManager(context: Context, private val scope: CoroutineScope) {
@@ -367,7 +367,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
     private var decodedSampleCount = 0
     private var lowLatencyBufferCeilingFrames = 0
     private var lastPartialWriteLogMs = 0L
-    @Volatile private var rttMs = 0L
+    @Volatile private var rttMs = -1L
     // Last time the control channel (SM_PING/PONG) confirmed the PC is reachable.
     // Lets us tell "PC is silent" apart from "connection lost".
     @Volatile private var lastPongMs = 0L
@@ -479,8 +479,8 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             deviceIp = device.ip,
             codecLabel = settings.codec.label,
             bitrateLabel = "측정 중",
-            latencyMs = settings.codec.estimatedBufferMs(settings.prebufferPackets),
-            latencyLabel = "${settings.codec.estimatedBufferMs(settings.prebufferPackets)}ms",
+            latencyMs = 0,
+            latencyLabel = "",
         )
         _audioLevel.value = 0f
         // Cancel the previous session BEFORE scheduling the new one: both sessions run
@@ -654,8 +654,10 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
     private suspend fun receiveAudio(socket: DatagramSocket, track: AudioTrack, device: DiscoveredDevice) {
         val senderAddress = InetAddress.getByName(device.ip)
         lastPongMs = android.os.SystemClock.elapsedRealtime()
-        rttMs = 0L
-        val queue = PriorityQueue<AudioPacket>(compareBy { it.seq })
+        rttMs = -1L
+        val queue = TimedAudioQueue<AudioPacket>(compareBy { it.seq }) {
+            PacketBufferTiming.durationNs(it.frames, it.sampleRate)
+        }
         var expectedSeq: Long? = null
         var received = 0L
         var lost = 0L
@@ -667,7 +669,26 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         var lastBitrateUpdateMs = 0L
         var totalFramesWritten = 0L
         var isBuffering = true
-        var smoothedLatencyMs = 0.0
+        val latencyMeter = PlaybackLatencyMeter(device.sampleRate)
+        val outputTimestamp = AudioTimestamp()
+        var measurementRouteId: Int? = null
+        var measurementRouteLabel = "출력 확인 중"
+        var measurementUnderruns = -1
+        var lastLatencyLogNs = 0L
+        fun refreshOutputRoute(): Int? {
+            val route = runCatching { track.routedDevice }.getOrNull()
+            val label = outputRouteLabel(route?.type)
+            if (route?.id != measurementRouteId || label != measurementRouteLabel) {
+                measurementRouteId = route?.id
+                measurementRouteLabel = label
+                latencyMeter.reset()
+                // Route identity is live state, not a numeric sampling preference.
+                // Don't put an old Bluetooth offset beside a new speaker or DAC.
+                _stats.value = _stats.value.copy(outputRouteLabel = label,
+                    deviceExtraMs = null, latencyLabel = "")
+            }
+            return route?.id
+        }
         var lastStatsSampleMs = 0L
         var lastAudioLevelUpdateMs = 0L
         var lastMaintenanceMs = 0L
@@ -685,6 +706,14 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         var lastUnstableMs = lastBufferChangeMs
         var shrinkPreviousFrames = 0
         var excessDelaySinceMs = 0L
+        val networkBufferPolicy = NetworkBufferPolicy()
+        val maxReceiveGapNs = AtomicLong(0L)
+        val maxSenderGapNs = AtomicLong(0L)
+        val receiveSequenceSkips = AtomicLong(0L)
+        var latePackets = 0L
+        var missingPackets = 0L
+        var reorderedPackets = 0L
+        var lastTimingLogMs = lastBufferChangeMs
         // AudioTrack is created already at settings.volume; only re-apply when the
         // user actually changes the volume, instead of on every played packet.
         var lastVolume = settings.volume
@@ -750,6 +779,9 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             val packet = DatagramPacket(recvBuffer, recvBuffer.size)
             var timeoutCount = 0
             var reconnectNotified = false
+            var previousReceiveNs = 0L
+            var previousSendNs = 0L
+            var previousSequence = 0L
             while (currentCoroutineContext().isActive) {
                 try {
                     packet.setData(recvBuffer, 0, recvBuffer.size)
@@ -758,6 +790,17 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     // PC's address rather than connecting this UDP socket to a port.
                     if (packet.address != senderAddress) continue
                     val parsed = parseAudioPacket(packet.data, packet.length) ?: continue
+                    if (previousReceiveNs != 0L) {
+                        recordMax(maxReceiveGapNs, parsed.recvNs - previousReceiveNs)
+                        if (parsed.seq == ((previousSequence + 1L) and 0xFFFF_FFFFL)) {
+                            recordMax(maxSenderGapNs, parsed.sendTimeNs - previousSendNs)
+                        } else if (parsed.seq > previousSequence + 1L) {
+                            receiveSequenceSkips.addAndGet(parsed.seq - previousSequence - 1L)
+                        }
+                    }
+                    previousReceiveNs = parsed.recvNs
+                    previousSendNs = parsed.sendTimeNs
+                    previousSequence = parsed.seq
                     if (timeoutCount > 0) {
                         timeoutCount = 0
                         reconnectNotified = false
@@ -843,6 +886,17 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
         var prevBuffer: ShortArray? = null
         var prevSamples = 0
         var fadeInNext = false
+        fun rebufferAfterNetworkGap(deepMode: Boolean) {
+            latencyMeter.reset()
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (networkBufferPolicy.onGap(now, deepMode)) {
+                Log.d("SoundMirrorPerf", "network reserve: +${networkBufferPolicy.extraMs}ms")
+            }
+            lastUnstableMs = now
+            isBuffering = true
+            resumeTrackAfterWrite = false
+            try { track.pause() } catch (_: Exception) {}
+        }
         try {
             while (currentCoroutineContext().isActive) {
                 // 1) Drain everything that has arrived (non-blocking) into the queue,
@@ -870,24 +924,23 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     queue.add(next)
                 }
 
-                val pktMs = (queue.peek()?.let { it.frames * 1000.0 / it.sampleRate.coerceAtLeast(1) } ?: 5.0)
-                    .coerceAtLeast(2.0)
                 // Deep-buffer mode follows the user's toggle (or battery mode), applied
                 // immediately. On = large jitter buffer (~DEEP_BUFFER_MS) that bridges
                 // Wi-Fi scans/bursts at the cost of latency; off = the user's low-latency
                 // depth.
                 val deepMode = deepBufferMode()
-                val prebufferTarget = if (!deepMode) settings.prebufferPackets else {
-                    maxOf(settings.prebufferPackets, (DEEP_BUFFER_MS / pktMs).roundToInt())
-                }
+                // A 10 ms FLAC frame can arrive as multiple shorter PCM datagrams.
+                // Keep a stable time budget, independent of the current wire packet.
+                val nominalPacketMs = if (settings.codec == AudioCodec.Pcm16) 5 else 10
+                val prebufferNs = PacketBufferTiming.targetNs(settings.prebufferPackets,
+                    nominalPacketMs, networkBufferPolicy.extraMs, deepMode)
 
                 // When the toggle flips into deep mode, rebuffer up to the deep target.
                 // This is one brief gap right when you enable it, then it stays smooth.
                 if (prevDeepMode != deepMode) {
                     lastUnstableMs = android.os.SystemClock.elapsedRealtime()
-                    // The latency target changes by roughly two seconds here. Do not
-                    // blend the previous mode's value into the new measurement.
-                    smoothedLatencyMs = 0.0
+                    // Pausing changes the mapping between frames and output time.
+                    latencyMeter.reset()
                     if (deepMode) {
                         isBuffering = true
                         resumeTrackAfterWrite = false
@@ -898,10 +951,21 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
 
                 // 2) Shed excess latency by dropping the oldest packets — never by
                 //    writing ahead (which only shifts latency into the track buffer).
-                val maxQueue = (prebufferTarget * 2).coerceAtLeast(prebufferTarget + 8)
-                if (queue.size > maxQueue) {
+                val baseMaxQueueNs = PacketBufferTiming.overflowNs(prebufferNs, nominalPacketMs)
+                // A burst can simply refill audio consumed during a receive gap.
+                // Count free hardware-buffer space before discarding that recovery
+                // audio; otherwise normal bursts are turned into audible skips.
+                val refillNs = if (queue.exceedsNs(baseMaxQueueNs)) runCatching {
+                    val head = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
+                    val bufferedFrames = (totalFramesWritten - head).coerceAtLeast(0L)
+                    val freeFrames = (activeTrackBufferFrames.toLong() - bufferedFrames).coerceAtLeast(0L)
+                    freeFrames * 1_000_000_000L / device.sampleRate.coerceAtLeast(1)
+                }.getOrDefault(0L) else 0L
+                val trimTargetNs = prebufferNs + refillNs
+                if (queue.exceedsNs(baseMaxQueueNs + refillNs)) {
+                    Log.d("SoundMirrorPerf", "network backlog: ${queue.durationNs / 1_000_000} -> ${trimTargetNs / 1_000_000}ms")
                     var dropped = 0L
-                    while (queue.size > prebufferTarget) {
+                    while (queue.exceedsNs(trimTargetNs)) {
                         val droppedPkt = queue.poll()
                         if (droppedPkt != null) {
                             dropped++
@@ -915,13 +979,42 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 // 3) (Re)buffering gate. While buffering, block for the next arrival so
                 //    we don't busy-spin, and accumulate up to the target before playing.
                 if (isBuffering) {
-                    if (queue.size >= prebufferTarget) {
+                    if (queue.durationNs >= prebufferNs) {
                         isBuffering = false
                         resumeTrackAfterWrite = true
                     } else {
                         val p = packetChannel.receiveCatching().getOrNull() ?: break
                         queue.add(p)
                         continue
+                    }
+                }
+
+                // A UDP burst may be delivered out of order, or its next packet may
+                // still be in the socket pump. Don't conceal/drop it immediately if
+                // AudioTrack already holds enough audio to wait briefly without a gap.
+                val missingSeq = expectedSeq
+                if (!resumeTrackAfterWrite && missingSeq != null &&
+                    queue.peek()?.let { it.seq > missingSeq } == true) {
+                    val waitMs = runCatching {
+                        val head = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
+                        PacketBufferTiming.reorderWaitMs(totalFramesWritten - head, device.sampleRate)
+                    }.getOrDefault(0L)
+                    if (waitMs > 0L) {
+                        val deadlineNs = System.nanoTime() + waitMs * 1_000_000L
+                        while (queue.peek()?.let { it.seq > missingSeq } == true) {
+                            val remainingNs = deadlineNs - System.nanoTime()
+                            if (remainingNs <= 0L) break
+                            val next = withTimeoutOrNull((remainingNs + 999_999L) / 1_000_000L) {
+                                packetChannel.receiveCatching().getOrNull()
+                            } ?: break
+                            if (next.seq < missingSeq) {
+                                latePackets++
+                                recyclePacket(next)
+                            } else {
+                                queue.add(next)
+                                if (next.seq == missingSeq) reorderedPackets++
+                            }
+                        }
                     }
                 }
 
@@ -932,14 +1025,36 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     // next packet; the (small) AudioTrack buffer keeps playing meanwhile,
                     // which is exactly the pacing we want. Only if the stall outlasts the
                     // buffer do we rebuffer cleanly, instead of chopping with silence.
-                    val p = withTimeoutOrNull(150L) { packetChannel.receiveCatching().getOrNull() }
+                    // Waiting a fixed 150 ms lets a short hardware buffer run dry
+                    // repeatedly while late packets trickle in. Rebuild the jitter
+                    // reserve once the queued audio has actually run out instead.
+                    val bufferedMs = runCatching {
+                        val head = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
+                        (totalFramesWritten - head).coerceAtLeast(0L) * 1000L /
+                            device.sampleRate.coerceAtLeast(1)
+                    }.getOrDefault(0L)
+                    // Small margin tolerates coarse playback-head updates without
+                    // rebuffering for an ordinary one-packet scheduling delay.
+                    val waitMs = (bufferedMs + 10L).coerceIn(10L, 150L)
+                    val underrunsBeforeWait = runCatching { track.underrunCount }.getOrDefault(0)
+                    val p = withTimeoutOrNull(waitMs) { packetChannel.receiveCatching().getOrNull() }
                     if (p != null) {
                         queue.add(p)
+                        if (runCatching { track.underrunCount }.getOrDefault(underrunsBeforeWait) >
+                            underrunsBeforeWait) {
+                            Log.d("SoundMirrorPerf", "rebuffer: receive gap exhausted output")
+                            rebufferAfterNetworkGap(deepMode)
+                        }
                     } else if (currentCoroutineContext().isActive) {
-                        lastUnstableMs = android.os.SystemClock.elapsedRealtime()
-                        isBuffering = true
-                        resumeTrackAfterWrite = false
-                        try { track.pause() } catch (_: Exception) {}
+                        // Head-position updates are coarse on Bluetooth. A timeout
+                        // alone is not evidence that output stopped; don't pause
+                        // healthy buffered playback on a scheduling estimate.
+                        val framesLeft = runCatching {
+                            totalFramesWritten - (track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL)
+                        }.getOrDefault(0L)
+                        if (framesLeft > 0L) continue
+                        Log.d("SoundMirrorPerf", "rebuffer: no packet within ${waitMs}ms output budget")
+                        rebufferAfterNetworkGap(deepMode)
                     } else {
                         break
                     }
@@ -948,17 +1063,22 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
 
                 val expected = expectedSeq
                 if (expected != null && playPacket.seq < expected) {
+                    latePackets++
                     recyclePacket(playPacket)
                     continue
                 }
                 if (expected != null && playPacket.seq > expected) {
                     lost += playPacket.seq - expected
-                    if (playPacket.codec == WireCodec.Opus) {
+                    missingPackets += playPacket.seq - expected
+                    // A rebuffered gap has already elapsed in real time. Inserting
+                    // replacement audio now would replay that gap and add latency.
+                    // Keep concealment only for short losses during active playout.
+                    if (!resumeTrackAfterWrite && playPacket.codec == WireCodec.Opus) {
                         // Opus has real packet-loss concealment — let it synthesise the gap.
                         val missing = (playPacket.seq - expected).coerceAtMost(5).toInt()
                         val plcSamples = concealOpus(playPacket.frames, missing, track)
                         totalFramesWritten += plcSamples / 2
-                    } else if (prevSamples > 0 && prevBuffer != null) {
+                    } else if (!resumeTrackAfterWrite && prevSamples > 0 && prevBuffer != null) {
                         // PCM/ADPCM/MULAW have no PLC. Fade the retained previous frame
                         // out to zero so a lost packet decays smoothly
                         // instead of a hard click, and flag the next frame to fade back in.
@@ -988,21 +1108,14 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 var decodedRms = -1f
                 val packetTimeMs = System.currentTimeMillis()
 
-                // Silence-aware latency shedding: when we're holding more than the target
-                // (queue backlog after a Wi-Fi burst, or a ballooned AudioTrack buffer),
-                // skip near-silent packets instead of playing them. Excess latency drains
-                // during quiet moments with no audible artifact, so the tick-causing hard
-                // trim below rarely needs to fire. Decoding still ran (keeps stateful
-                // codecs like Opus consistent) and seq state was already advanced above.
-                val aheadMs = try {
-                    (totalFramesWritten - (track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL)) *
-                        1000.0 / device.sampleRate.coerceAtLeast(1)
-                } catch (_: Exception) { 0.0 }
-                if (queue.size > prebufferTarget || aheadMs > 90.0) {
-                    // This RMS is operational: it must run even with no UI subscriber
-                    // because it lets us shed accumulated latency during silence.
-                    decodedRms = pcmAmplitude(decoded, samples)
-                    if (decodedRms < SILENCE_SHED_RMS) {
+                // Only discard digital silence from excess network backlog. A normal
+                // Bluetooth AudioTrack can hold >90 ms: treating that as excess gated
+                // quiet speech/music and repeatedly starved the device's own buffer.
+                // Preserve startup/rebuffer reserves and the intentional deep buffer.
+                // Decode first so stateful codecs still advance across discarded data.
+                if (!deepMode && !resumeTrackAfterWrite && queue.exceedsNs(prebufferNs)) {
+                    if (isDigitalSilence(decoded, samples)) {
+                        decodedRms = 0f
                         if (_audioLevel.subscriptionCount.value > 0 &&
                             packetTimeMs - lastAudioLevelUpdateMs >= AUDIO_LEVEL_UPDATE_INTERVAL_MS
                         ) {
@@ -1037,6 +1150,8 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     }
                     fadeInNext = false
                 }
+                val packetFirstFrame = totalFramesWritten
+                val packetWriteStartNs = System.nanoTime()
                 val written = writeFully(track, decoded, samples)
                 if (resumeTrackAfterWrite && written > 0) {
                     // writeFully starts playback as soon as priming makes progress,
@@ -1063,6 +1178,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                 // checking it even when the user freezes numeric metric sampling.
                 if (now - lastMaintenanceMs >= PLAYBACK_MAINTENANCE_INTERVAL_MS) {
                     lastMaintenanceMs = now
+                    refreshOutputRoute()
                     val maintenanceNow = android.os.SystemClock.elapsedRealtime()
                     val underrunCount = runCatching { track.underrunCount }
                         .getOrDefault(lastUnderrunCount.coerceAtLeast(0))
@@ -1074,9 +1190,12 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     // 1x low-latency setting before the next sound starts.
                     val audibleUnderrun = underrunAdvanced &&
                         (if (decodedRms >= 0f) decodedRms else pcmAmplitude(decoded, samples)) >=
-                            SILENCE_SHED_RMS
+                            AUDIBLE_UNDERRUN_RMS
                     if (underrunAdvanced || isBuffering || resumeTrackAfterWrite) {
                         lastUnstableMs = maintenanceNow
+                    }
+                    if (networkBufferPolicy.onStable(maintenanceNow, lastUnstableMs, deepMode)) {
+                        Log.d("SoundMirrorPerf", "stable network reserve: +${networkBufferPolicy.extraMs}ms")
                     }
                     if (audibleUnderrun && shrinkPreviousFrames > 0) {
                         // A reduction that caused starvation is not retried again
@@ -1140,6 +1259,18 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                     } catch (_: Exception) {
                         0.0
                     }
+                    if (maintenanceNow - lastTimingLogMs >= 5000L) {
+                        lastTimingLogMs = maintenanceNow
+                        Log.d("SoundMirrorPerf", "timing: rxGap=${maxReceiveGapNs.getAndSet(0L) / 1_000_000}ms " +
+                            "senderGap=${maxSenderGapNs.getAndSet(0L) / 1_000_000}ms " +
+                            "seqJumps=${receiveSequenceSkips.getAndSet(0L)} late=$latePackets " +
+                            "missing=$missingPackets reordered=$reorderedPackets codec=${playPacket.codec.displayName} " +
+                            "output=${maintenanceTrackDelayMs.toInt()}ms underruns=$underrunCount " +
+                            "reserve=+${networkBufferPolicy.extraMs}ms")
+                        latePackets = 0L
+                        missingPackets = 0L
+                        reorderedPackets = 0L
+                    }
                     // Some Bluetooth devices legitimately require >100 ms of output
                     // buffering. Only flush persistent delay beyond the active size.
                     val trimThresholdMs = maxOf(100.0,
@@ -1166,7 +1297,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                         prevSamples = 0
                         prevBuffer = null
                         fadeInNext = false
-                        smoothedLatencyMs = 0.0
+                        latencyMeter.reset()
                         isBuffering = true
                         excessDelaySinceMs = 0L
                         lastUnstableMs = maintenanceNow
@@ -1175,7 +1306,7 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
 
                 // 6) Sample and publish numeric metrics only at the selected cadence.
                 // When screen is off or app is backgrounded (_stats.subscriptionCount == 0),
-                // bypass heavy queue iteration and StateFlow object allocation for battery saving.
+                // skip timestamp queries and StateFlow object allocation for battery saving.
                 val statsSampleIntervalMs = settings.statsRefreshMs
                 if (statsSampleIntervalMs > 0L && now - lastStatsSampleMs >= statsSampleIntervalMs) {
                     lastStatsSampleMs = now
@@ -1196,26 +1327,51 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                                 }
                             }
                         }
-                        val networkDelayMs = rttMs / 2.0
-                        // Sum actual packet durations. PCM packets can be split at the MTU
-                        // boundary, so queue size multiplied by one packet's duration is not
-                        // a reliable latency estimate.
-                        val queueDelayMs = queue.sumOf {
-                            it.frames * 1000.0 / it.sampleRate.coerceAtLeast(1)
-                        }
-                        val trackDelayMs = try {
+                        // Track one real packet from socket arrival to its first output
+                        // frame. Unlike queue snapshots this also includes the receive
+                        // channel, decoding and time spent blocked inside AudioTrack.write.
+                        val measurement = if (written > 0 && !isBuffering) runCatching {
+                            refreshOutputRoute()
+                            val underruns = track.underrunCount
+                            if (underruns != measurementUnderruns) {
+                                latencyMeter.reset()
+                                measurementUnderruns = underruns
+                            }
+                            val pollNs = System.nanoTime()
+                            if (latencyMeter.shouldPoll(pollNs)) {
+                                if (track.getTimestamp(outputTimestamp)) {
+                                    latencyMeter.timestamp(outputTimestamp.framePosition,
+                                        outputTimestamp.nanoTime, pollNs, totalFramesWritten)
+                                } else {
+                                    latencyMeter.timestampUnavailable(pollNs)
+                                }
+                            }
                             val head = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
-                            val written = totalFramesWritten - head
-                            if (written > 0) (written * 1000.0 / device.sampleRate.coerceAtLeast(1)) else 0.0
-                        } catch (_: Exception) {
-                            0.0
+                            latencyMeter.sample(playPacket.recvNs, packetWriteStartNs,
+                                packetFirstFrame, totalFramesWritten, head, System.nanoTime())
+                        }.getOrNull() else null
+                        val networkEstimate = rttMs.takeIf { it >= 0L &&
+                            android.os.SystemClock.elapsedRealtime() - lastPongMs < 15000L
+                        }?.let { (it / 2.0).roundToInt() }
+                        val measurementLabel = when (measurement?.timestampBased) {
+                            true -> "출력 타임스탬프 기준"
+                            false -> "재생 위치 기준 · 추정"
+                            null -> ""
                         }
-
-                        val totalLatencyMs = networkDelayMs + queueDelayMs + trackDelayMs
-                        if (smoothedLatencyMs == 0.0) {
-                            smoothedLatencyMs = totalLatencyMs
-                        } else {
-                            smoothedLatencyMs += (totalLatencyMs - smoothedLatencyMs) * 0.1
+                        val logNs = System.nanoTime()
+                        val audioLatencyMs = measurement?.audioMs?.let { audioMs ->
+                            networkEstimate?.let { (audioMs + it).roundToInt() }
+                        }
+                        val deviceExtraMs = if (measurementRouteId != null) {
+                            measurement?.deviceExtraMs?.roundToInt()
+                        } else null
+                        if (measurement != null && logNs - lastLatencyLogNs >= 5_000_000_000L) {
+                            lastLatencyLogNs = logNs
+                            Log.d("SoundMirrorLat", "measured: receiver=${measurement.receiverMs.roundToInt()}ms " +
+                                "appWait=${measurement.appWaitMs.roundToInt()}ms output=${measurement.outputMs.roundToInt()}ms " +
+                                "timestamp=${measurement.timestampBased} networkEstimate=$networkEstimate " +
+                                "audio=$audioLatencyMs deviceExtra=$deviceExtraMs route=$measurementRouteLabel " +
+                                "prebuffer=${settings.prebufferPackets} queue=${queue.size} queueMs=${queue.durationNs / 1_000_000}")
                         }
                         val lossRate = if (received + lost == 0L) 0f else lost.toFloat() / (received + lost).toFloat()
 
@@ -1226,10 +1382,15 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
                             packetLoss = lossRate,
                             jitterBuffer = queue.size,
                             jitterMs = jitterEstimateMs.roundToInt(),
-                            latencyMs = smoothedLatencyMs.roundToInt(),
+                            latencyMs = audioLatencyMs ?: 0,
                             codecLabel = playPacket.codec.displayName,
                             bitrateLabel = liveBitrateLabel,
-                            latencyLabel = "${settings.codec.estimatedBufferMs(settings.prebufferPackets)}ms",
+                            latencyLabel = if (audioLatencyMs != null) measurementLabel else "",
+                            appWaitMs = measurement?.appWaitMs?.roundToInt() ?: 0,
+                            outputWaitMs = measurement?.outputMs?.roundToInt() ?: 0,
+                            networkEstimateMs = networkEstimate,
+                            deviceExtraMs = deviceExtraMs,
+                            outputRouteLabel = measurementRouteLabel,
                         )
                     }
                 }
@@ -1553,6 +1714,22 @@ class AudioStreamClient(private val context: Context, private val scope: Corouti
             }
         }
         return offset
+    }
+
+    private fun recordMax(target: AtomicLong, value: Long) {
+        var previous = target.get()
+        while (value > previous) {
+            if (target.compareAndSet(previous, value)) return
+            previous = target.get()
+        }
+    }
+
+    private fun isDigitalSilence(payload: ShortArray, sampleCount: Int): Boolean {
+        if (sampleCount <= 0) return false
+        for (i in 0 until sampleCount) {
+            if (payload[i] != 0.toShort()) return false
+        }
+        return true
     }
 
     private fun pcmAmplitude(payload: ShortArray, sampleCount: Int): Float {
@@ -1942,18 +2119,43 @@ private fun ConnectedStatsPanel(stats: StreamStats, settings: StreamSettings) {
             .background(Color(0xFFF7F9FC))
             .padding(12.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Stat("지연", "${(stats.latencyMs.takeIf { it > 0 } ?: settings.codec.estimatedBufferMs(settings.prebufferPackets))} ms", Modifier.weight(1f))
-            Stat("지터", "${stats.jitterMs} ms", Modifier.weight(1f))
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                buildAnnotatedString {
+                    append("오디오 지연(추정)")
+                    withStyle(SpanStyle(color = Color(0xFF007AFF), fontSize = 10.sp)) {
+                        append(" + ")
+                        append(if (stats.outputRouteLabel == "출력 확인 중") stats.outputRouteLabel
+                            else "${stats.outputRouteLabel} 지연")
+                    }
+                },
+                color = Color(0xFF8A94A6), fontSize = 11.sp,
+            )
+            // Same base typography as Stat; only the inline extra is smaller/blue.
+            Text(
+                buildAnnotatedString {
+                    if (stats.latencyLabel.isEmpty()) {
+                        append("측정 중")
+                    } else {
+                        append("${stats.latencyMs} ms")
+                    }
+                    withStyle(SpanStyle(color = Color(0xFF007AFF), fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium)) {
+                        append(if (stats.latencyLabel.isNotEmpty()) {
+                            stats.deviceExtraMs?.let { " +${it} ms" } ?: " + —"
+                        } else " + —")
+                    }
+                },
+                color = Color(0xFF111827), fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
         Spacer(Modifier.height(10.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            Stat("지터", "${stats.jitterMs} ms", Modifier.weight(1f))
             Stat("유실", "${(stats.packetLoss * 100f).roundToInt()}%", Modifier.weight(1f))
             Stat("오디오 수신률", stats.bitrateLabel.ifEmpty { "측정 중" }, Modifier.weight(1f))
         }
@@ -1964,16 +2166,17 @@ private fun ConnectedStatsPanel(stats: StreamStats, settings: StreamSettings) {
         ) {
             Stat("코덱", stats.codecLabel.ifEmpty { settings.codec.label }, Modifier.weight(1f))
             Stat(
-                if (settings.deepBufferActive) "깊은 버퍼" else "버퍼 대기",
-                if (settings.deepBufferActive) {
-                    "약 ${DEEP_BUFFER_MS.roundToInt()} ms"
-                } else {
-                    "${settings.prebufferPackets}개 · ${settings.codec.estimatedBufferMs(settings.prebufferPackets)}ms"
-                },
+                "앱 내 대기",
+                if (stats.latencyLabel.isEmpty()) "측정 중" else "${stats.appWaitMs} ms",
                 Modifier.weight(1f),
             )
             Stat("출력", if (settings.requestLowLatency) "저지연" else "일반", Modifier.weight(1f))
         }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "PC 캡처 제외 · 기본/추가 지연 모두 추정값",
+            color = Color(0xFF7A8494), fontSize = 10.sp,
+        )
     }
 }
 
@@ -2084,9 +2287,9 @@ private fun QualityPanel(
     onOpusBitrateChange: (Int) -> Unit,
 ) {
     CardBox {
-        Text("패킷 버퍼 대기량 (지연 시간 조절)", color = Color(0xFF111827), fontSize = 17.sp, fontWeight = FontWeight.Bold)
+        Text("초기 패킷 버퍼 대기량", color = Color(0xFF111827), fontSize = 17.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(4.dp))
-        Text("슬라이더를 낮추면 지연이 줄어들고(영상/게임 추천), 높이면 버퍼를 많이 쌓아 끊김에 강해집니다.", color = Color(0xFF7A8494), fontSize = 12.sp)
+        Text("연결·재버퍼링 시 모을 패킷 수입니다. 재생 중 항상 유지되는 대기량이 아니며, 실제 지연은 위의 측정값으로 확인하세요.", color = Color(0xFF7A8494), fontSize = 12.sp)
         Spacer(Modifier.height(16.dp))
         Slider(
             value = prebufferPackets.toFloat(),
@@ -2100,7 +2303,7 @@ private fun QualityPanel(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text("현재 설정: ${prebufferPackets} 패킷 (약 ${codec.estimatedBufferMs(prebufferPackets)}ms 지연)", color = Color(0xFF007AFF), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text("현재 설정: ${prebufferPackets} 패킷 분량", color = Color(0xFF007AFF), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Text(
                 text = when (prebufferPackets) {
                     in 2..3 -> "저지연 (네트워크 양호 필수)"
