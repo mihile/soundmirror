@@ -23,8 +23,8 @@ android {
         applicationId = "com.soundmirror.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.1.5"
+        versionCode = 7
+        versionName = "1.1.6"
 
         ndk {
             // arm64 covers virtually all modern phones; v7a for older 32-bit devices.

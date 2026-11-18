@@ -45,6 +45,7 @@ const DISCOVERY_PORT: u16 = 45670;
 const CONTROL_PORT: u16 = 45671;
 const CLIENT_AUDIO_PORT: u16 = 45672;
 const BLOCK_MS: u64 = 5;
+const AUDIO_SOCKET_REBIND_INTERVAL: Duration = Duration::from_secs(8);
 
 // WAVEFORMAT Constants
 const WAVE_FORMAT_PCM: u16 = 1;
@@ -114,6 +115,8 @@ static ACTIVE_SAMPLE_RATE: LazyLock<Mutex<u32>> = LazyLock::new(|| Mutex::new(0)
 static LOCAL_IP: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("127.0.0.1".to_string()));
 // Signals the audio loop to restart capture when the default render device changes.
 static DEVICE_CHANGED: AtomicBool = AtomicBool::new(false);
+// Coalesce receiver recovery requests until the audio thread has data to send.
+static AUDIO_SOCKET_REBIND_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn set_output_volume_percent(percent: u32) {
     OUTPUT_VOLUME_PERCENT.store(percent.min(200), Ordering::Relaxed);
@@ -286,10 +289,6 @@ fn default_render_name(device: &IMMDevice) -> String {
 fn add_client(addr: SocketAddrV4, codec: u8, opus_bitrate_bps: i32) {
     let now = Instant::now();
     let codec_name = match codec {
-        1 => "ADPCM",
-        2 => "MULAW",
-        3 => "MULAW_LITE",
-        4 => "ADPCM_LITE",
         5 => "OPUS",
         6 => "FLAC",
         _ => "PCM16",
@@ -524,9 +523,10 @@ mod tests {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             (seed >> 16) as i16
         }).collect();
-        let encoded = encode_flac(&frame, 480, 48000, &mut Vec::new()).unwrap();
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        let encoded = encode_flac(&frame, 480, 48000, &mut Vec::new(), &mut sink).unwrap();
         assert!(encoded.len() + 28 > 1400);
-        for encoded in [Some(encoded.as_slice()), None] {
+        for encoded in [Some(encoded), None] {
             let mut seq = u32::MAX;
             let mut packets = Vec::new();
             send_lossless_frame(&mut seq, 48000, &frame, encoded,
@@ -631,101 +631,6 @@ fn convert_to_stereo_i16(data: &[u8], frames: u32, fmt: &WAVEFORMATEX, out: &mut
     }
 }
 
-fn pcm_at(pcm: &[u8], frame: usize, channel: usize) -> i16 {
-    let offset = frame * 4 + channel * 2;
-    if offset + 1 < pcm.len() {
-        i16::from_le_bytes([pcm[offset], pcm[offset + 1]])
-    } else {
-        0
-    }
-}
-
-fn linear_to_mulaw(sample: i16) -> u8 {
-    let bias = 0x84;
-    let sign = (sample >> 8) & 0x80;
-    let mut value = if sign != 0 { -sample } else { sample } as i32;
-    if value > 32635 {
-        value = 32635;
-    }
-    value += bias;
-    let mut exponent = 7;
-    let mut mask = 0x4000;
-    while (value & mask) == 0 && exponent > 0 {
-        exponent -= 1;
-        mask >>= 1;
-    }
-    let mantissa = (value >> (exponent + 3)) & 0x0f;
-    !((sign as u8) | ((exponent as u8) << 4) | (mantissa as u8))
-}
-
-fn encode_mulaw(pcm: &[u8], out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(pcm.len() / 2);
-    for i in (0..pcm.len()).step_by(2) {
-        if i + 1 < pcm.len() {
-            let sample = i16::from_le_bytes([pcm[i], pcm[i + 1]]);
-            out.push(linear_to_mulaw(sample));
-        }
-    }
-}
-
-fn encode_ima_sample(sample: i16, predictor: &mut i32, index: &mut i32) -> u8 {
-    static STEP_TABLE: [i32; 89] = [
-        7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,
-        88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,
-        544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,
-        2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,
-        10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767
-    ];
-    static INDEX_TABLE: [i32; 16] = [-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8];
-    
-    let step = STEP_TABLE[*index as usize];
-    let mut diff = sample as i32 - *predictor;
-    let mut code = 0u8;
-    if diff < 0 {
-        code = 8;
-        diff = -diff;
-    }
-    let mut delta = step >> 3;
-    if diff >= step {
-        code |= 4;
-        diff -= step;
-        delta += step;
-    }
-    if diff >= (step >> 1) {
-        code |= 2;
-        diff -= step >> 1;
-        delta += step >> 1;
-    }
-    if diff >= (step >> 2) {
-        code |= 1;
-        delta += step >> 2;
-    }
-    
-    *predictor += if (code & 8) != 0 { -delta } else { delta };
-    if *predictor > 32767 {
-        *predictor = 32767;
-    }
-    if *predictor < -32768 {
-        *predictor = -32768;
-    }
-    
-    *index += INDEX_TABLE[(code & 0x0f) as usize];
-    if *index < 0 {
-        *index = 0;
-    }
-    if *index > 88 {
-        *index = 88;
-    }
-    
-    code & 0x0f
-}
-
-struct AdpcmState {
-    left_index: i32,
-    right_index: i32,
-}
-
 // Per-client Opus encoder. Opus needs fixed frame sizes, so we accumulate the
 // variable-length WASAPI buffers into 10 ms frames before encoding. Each client
 // keeps its own encoder and sequence counter (the stream is stateful).
@@ -819,55 +724,21 @@ static FLAC_CONFIG: LazyLock<flacenc::error::Verified<flacenc::config::Encoder>>
 });
 
 // Encode one interleaved stereo i16 block as a standalone FLAC stream.
-fn encode_flac(frame_i16: &[i16], frames_per_channel: usize, sample_rate: u32, s32: &mut Vec<i32>) -> Option<Vec<u8>> {
+fn encode_flac<'a>(
+    frame_i16: &[i16],
+    frames_per_channel: usize,
+    sample_rate: u32,
+    s32: &mut Vec<i32>,
+    sink: &'a mut flacenc::bitsink::ByteSink,
+) -> Option<&'a [u8]> {
     use flacenc::component::BitRepr;
     s32.clear();
     s32.extend(frame_i16.iter().map(|&x| x as i32));
     let source = flacenc::source::MemSource::from_samples(s32.as_slice(), 2, 16, sample_rate as usize);
     let stream = flacenc::encode_with_fixed_block_size(&FLAC_CONFIG, source, frames_per_channel).ok()?;
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    stream.write(&mut sink).ok()?;
-    Some(sink.as_slice().to_vec())
-}
-
-// Halve the sample rate for the "lite" codecs. Instead of dropping every other
-// frame (pure decimation, which folds high frequencies back as audible aliasing),
-// average each adjacent stereo frame pair as a cheap 2-tap low-pass before
-// decimating. This noticeably reduces the metallic/harsh artefacts on lite modes.
-fn downsample_half(pcm: &[u8], out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(pcm.len() / 2);
-    for chunk in pcm.chunks_exact(8) {
-        let l0 = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
-        let r0 = i16::from_le_bytes([chunk[2], chunk[3]]) as i32;
-        let l1 = i16::from_le_bytes([chunk[4], chunk[5]]) as i32;
-        let r1 = i16::from_le_bytes([chunk[6], chunk[7]]) as i32;
-        let l = ((l0 + l1) / 2) as i16;
-        let r = ((r0 + r1) / 2) as i16;
-        out.extend_from_slice(&l.to_le_bytes());
-        out.extend_from_slice(&r.to_le_bytes());
-    }
-}
-
-fn encode_adpcm(pcm: &[u8], frames: u32, state: &mut AdpcmState, out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(frames as usize + 8);
-    if frames == 0 || pcm.len() < 4 {
-        return;
-    }
-    let mut left = pcm_at(pcm, 0, 0) as i32;
-    let mut right = pcm_at(pcm, 0, 1) as i32;
-    
-    out.extend_from_slice(&(left as i16).to_le_bytes());
-    out.push(state.left_index as u8);
-    out.extend_from_slice(&(right as i16).to_le_bytes());
-    out.push(state.right_index as u8);
-    
-    for frame in 1..frames as usize {
-        let l = encode_ima_sample(pcm_at(pcm, frame, 0), &mut left, &mut state.left_index);
-        let r = encode_ima_sample(pcm_at(pcm, frame, 1), &mut right, &mut state.right_index);
-        out.push(l | (r << 4));
-    }
+    sink.clear();
+    stream.write(sink).ok()?;
+    Some(sink.as_slice())
 }
 
 fn build_packet(seq: u32, sample_rate: u32, frames: u16, codec: u8, payload: &[u8], packet: &mut Vec<u8>) {
@@ -1037,14 +908,6 @@ fn parse_codec(text: &str) -> u8 {
         6
     } else if text.contains("OPUS") {
         5
-    } else if text.contains("ADPCM_LITE") {
-        4
-    } else if text.contains("MULAW_LITE") {
-        3
-    } else if text.contains("ADPCM") {
-        1
-    } else if text.contains("MULAW") {
-        2
     } else {
         0
     }
@@ -1054,13 +917,8 @@ fn parse_codec(text: &str) -> u8 {
 struct ConnectPayload {
     #[serde(rename = "opusBitrate")]
     opus_bitrate_kbps: Option<i32>,
-}
-
-fn parse_opus_bitrate(text: &str) -> i32 {
-    let payload = text.strip_prefix("SM_CONNECT ")
-        .and_then(|json| serde_json::from_str::<ConnectPayload>(json).ok());
-    payload.and_then(|p| p.opus_bitrate_kbps)
-        .unwrap_or(DEFAULT_OPUS_BITRATE / 1000).clamp(128, 160) * 1000
+    #[serde(default, rename = "recoverAudio")]
+    recover_audio: bool,
 }
 
 fn control_loop() {
@@ -1097,8 +955,14 @@ fn control_loop() {
                             CLIENT_AUDIO_PORT,
                         );
                         let codec = parse_codec(text);
-                        let opus_bitrate_bps = parse_opus_bitrate(text);
+                        let payload = text.strip_prefix("SM_CONNECT ")
+                            .and_then(|json| serde_json::from_str::<ConnectPayload>(json).ok());
+                        let opus_bitrate_bps = payload.as_ref().and_then(|p| p.opus_bitrate_kbps)
+                            .unwrap_or(DEFAULT_OPUS_BITRATE / 1000).clamp(128, 160) * 1000;
                         add_client(client_addr, codec, opus_bitrate_bps);
+                        if payload.is_some_and(|p| p.recover_audio) {
+                            AUDIO_SOCKET_REBIND_REQUESTED.store(true, Ordering::Release);
+                        }
                     } else if text.starts_with("SM_PING") {
                         let pong = text.replace("SM_PING", "SM_PONG");
                         let _ = socket.send_to(pong.as_bytes(), from);
@@ -1171,7 +1035,8 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
     let ip = primary_ipv4();
     set_local_ip(ip.clone());
 
-    let out_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut out_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut next_audio_socket_rebind = Instant::now();
     
     println!("SoundMirror Rust sender");
     println!("Primary IPv4: {}", ip);
@@ -1187,10 +1052,6 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
         let _ = SetThreadPriority(thread, THREAD_PRIORITY_HIGHEST);
     }
     
-    // IMA ADPCM is a stateful, sequential encoder. Each client must keep its own
-    // predictor/index so two phones streaming ADPCM at once don't corrupt each
-    // other's state (which previously produced loud noise).
-    let mut adpcm_states: HashMap<SocketAddrV4, AdpcmState> = HashMap::new();
     let mut opus_states: HashMap<SocketAddrV4, OpusClientState> = HashMap::new();
     let mut flac_states: HashMap<SocketAddrV4, FlacClientState> = HashMap::new();
     // Sequence numbers belong to the long-lived streaming thread, not this capture
@@ -1198,12 +1059,9 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
     let mut opus_out = [0u8; 4000];
     let mut pcm_data = Vec::new();
     let mut pcm_i16 = Vec::new();
-    let mut lite_payload = Vec::new();
     let mut packet_scratch = Vec::with_capacity(4096);
-    // Encoding and send_to finish before the next client uses these buffers.
-    // Keep storage across packets without sharing codec state between clients.
-    let mut encoded_scratch = Vec::with_capacity(4096);
     let mut flac_samples = Vec::with_capacity((sample_rate / 100) as usize * 2);
+    let mut flac_bitstream = flacenc::bitsink::ByteSink::new();
     let mut flac_fallback_pcm = Vec::new();
     let mut volume_limiter = VolumeLimiter::new();
     let mut active_clients = Vec::with_capacity(4);
@@ -1264,11 +1122,6 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
 
                         // Encoder cleanup follows client snapshot housekeeping instead
                         // of scanning every map on every 5 ms capture packet.
-                        adpcm_states.retain(|addr, _| {
-                            active_clients
-                                .iter()
-                                .any(|c| &c.addr == addr && (c.codec == 1 || c.codec == 4))
-                        });
                         opus_states.retain(|addr, _| {
                             active_clients.iter().any(|c| &c.addr == addr && c.codec == 5)
                         });
@@ -1289,7 +1142,7 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
                         }
 
                         // Apply one shared gain stage before codec-specific work so
-                        // PCM, Opus, FLAC and the lite codecs all sound equally loud.
+                        // PCM, Opus and FLAC all sound equally loud.
                         volume_limiter.apply(&mut pcm_data, get_output_volume_percent());
                     }
 
@@ -1298,55 +1151,31 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
                     let clients = &active_clients;
 
                     if !clients.is_empty() {
-
-                    // Precompute the half-rate payload once; all "lite" clients share it.
-                    if clients.iter().any(|c| c.codec == 3 || c.codec == 4) {
-                        downsample_half(&pcm_data, &mut lite_payload);
+                    if AUDIO_SOCKET_REBIND_REQUESTED.load(Ordering::Relaxed)
+                        && Instant::now() >= next_audio_socket_rebind
+                        && AUDIO_SOCKET_REBIND_REQUESTED.swap(false, Ordering::AcqRel)
+                    {
+                        next_audio_socket_rebind = Instant::now() + AUDIO_SOCKET_REBIND_INTERVAL;
+                        // Bind before dropping the old socket so Windows allocates a
+                        // different source port. Capture, encoders and sequences carry on.
+                        match UdpSocket::bind("0.0.0.0:0") {
+                            Ok(socket) => {
+                                println!("Audio UDP socket refreshed: {:?} -> {:?}",
+                                    out_socket.local_addr(), socket.local_addr());
+                                out_socket = socket;
+                            }
+                            Err(err) => eprintln!("Audio UDP socket refresh failed: {err}"),
+                        }
                     }
 
-                    // Stateless / per-packet codecs (PCM16, ADPCM, MULAW + lite).
-                    for client in clients {
-                        if client.codec == 5 || client.codec == 6 {
-                            continue; // Stateful/frame codecs are accumulated separately below.
-                        }
-                        let is_lite = client.codec == 3 || client.codec == 4;
-                        let processed_payload: &[u8] = if is_lite { &lite_payload } else { &pcm_data };
-                        let target_frames = (processed_payload.len() / 4) as u32;
-                        let target_sample_rate = if is_lite { sample_rate / 2 } else { sample_rate };
-                        let client_seq = client_seqs.entry(client.addr).or_insert(0);
-
-                        match client.codec {
-                            1 | 4 => {
-                                let state = adpcm_states
-                                    .entry(client.addr)
-                                    .or_insert(AdpcmState { left_index: 0, right_index: 0 });
-                                encode_adpcm(processed_payload, target_frames, state, &mut encoded_scratch);
-                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded_scratch, &mut packet_scratch);
-                                let _ = out_socket.send_to(&packet_scratch, client.addr);
-                                *client_seq = client_seq.wrapping_add(1);
-                            }
-                            2 | 3 => {
-                                encode_mulaw(processed_payload, &mut encoded_scratch);
-                                build_packet(*client_seq, target_sample_rate, target_frames as u16, client.codec, &encoded_scratch, &mut packet_scratch);
-                                let _ = out_socket.send_to(&packet_scratch, client.addr);
-                                *client_seq = client_seq.wrapping_add(1);
-                            }
-                            _ => {
-                                // PCM16 is large (uncompressed). Split into sub-MTU packets so
-                                // one lost IP fragment costs a single small chunk, not the whole
-                                // datagram. 320 frames * 4 + 28 header = 1308 bytes (< 1500 MTU).
-                                const MAX_PCM_FRAMES: usize = 320;
-                                let total = target_frames as usize;
-                                let mut start = 0usize;
-                                while start < total {
-                                    let count = (total - start).min(MAX_PCM_FRAMES);
-                                    let chunk = &processed_payload[start * 4..(start + count) * 4];
-                                    build_packet(*client_seq, target_sample_rate, count as u16, 0, chunk, &mut packet_scratch);
-                                    let _ = out_socket.send_to(&packet_scratch, client.addr);
-                                    *client_seq = client_seq.wrapping_add(1);
-                                    start += count;
-                                }
-                            }
+                    // Split raw PCM into datagrams below the Ethernet MTU.
+                    for client in clients.iter().filter(|c| c.codec == 0) {
+                        let seq = client_seqs.entry(client.addr).or_insert(0);
+                        for chunk in pcm_data.chunks(320 * 4) {
+                            let frames = (chunk.len() / 4) as u16;
+                            build_packet(*seq, sample_rate, frames, 0, chunk, &mut packet_scratch);
+                            let _ = out_socket.send_to(&packet_scratch, client.addr);
+                            *seq = seq.wrapping_add(1);
                         }
                     }
 
@@ -1409,9 +1238,9 @@ fn run_audio(client_seqs: &mut HashMap<SocketAddrV4, u32>) -> Result<(), Box<dyn
                                 state.frame.clear();
                                 state.frame.extend(state.accum.drain(0..state.frame_total_samples));
                                 let encoded = encode_flac(&state.frame, state.frame_per_channel as usize,
-                                    sample_rate, &mut flac_samples);
+                                    sample_rate, &mut flac_samples, &mut flac_bitstream);
                                 send_lossless_frame(client_seq, sample_rate, &state.frame,
-                                    encoded.as_deref(), &mut packet_scratch, &mut flac_fallback_pcm,
+                                    encoded, &mut packet_scratch, &mut flac_fallback_pcm,
                                     |packet| { let _ = out_socket.send_to(packet, client.addr); });
                             }
                         }
@@ -1705,10 +1534,6 @@ impl eframe::App for SoundMirrorApp {
                         } else {
                             for client in &clients {
                                 let codec_name = match client.codec {
-                                    1 => "ADPCM (384kbps)".to_string(),
-                                    2 => "MULAW (768kbps)".to_string(),
-                                    3 => "MULAW_LITE (384kbps)".to_string(),
-                                    4 => "ADPCM_LITE (192kbps)".to_string(),
                                     5 => format!("OPUS ({}kbps)", client.opus_bitrate_bps / 1000),
                                     6 => "FLAC (자동 무손실)".to_string(),
                                     _ => "PCM16 (1536kbps)".to_string(),

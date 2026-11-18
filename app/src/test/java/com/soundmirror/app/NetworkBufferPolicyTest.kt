@@ -36,4 +36,17 @@ class NetworkBufferPolicyTest {
         assertTrue(policy.onStable(380_000L, 260_000L, false))
         assertEquals(20, policy.extraMs)
     }
+
+    @Test fun scanSizedDeliveryStallRaisesReserveAtFirstRecovery() {
+        val policy = NetworkBufferPolicy()
+        assertFalse(policy.onGap(0L, false))
+        // 164 ms between arrivals with a 10 ms sender interval, a 60 ms
+        // output limit and a 10 ms user prebuffer.
+        assertTrue(policy.onDeliveryStall(100L, 154L, 60L, 10L))
+        assertEquals(120, policy.extraMs)
+        assertFalse(policy.onDeliveryStall(200L, 500L, 60L, 10L))
+        assertFalse(policy.onStable(30_099L, 0L, false))
+        assertTrue(policy.onStable(30_100L, 0L, false))
+        assertEquals(100, policy.extraMs)
+    }
 }
